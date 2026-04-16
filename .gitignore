@@ -1,0 +1,59 @@
+# Scan output directories
+pci_scan_*/
+scan_*/
+*/raw/
+*/evidence/
+*/history/
+
+# Credentials and sensitive data (NEVER commit)
+creds.txt
+credentials.txt
+*.creds
+*_creds.txt
+
+# Target files with real CDE assets
+cde_targets.txt
+production_targets.txt
+!cde_targets_example.txt
+
+# Temp files
+*.log
+*.lock
+*.tmp
+/tmp/
+
+# Reports (contain sensitive findings)
+relatorio_*.html
+relatorio_*.pdf
+report_*.html
+
+# ZAP artifacts
+~/.ZAP/
+zap.log
+zap_daemon.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Go
+go.sum
+
+# Archives
+*.tar
+*.tar.gz
+*.zip

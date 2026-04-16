@@ -1,0 +1,18 @@
+# ═══════════════════════════════════════════════════════════════
+# PCI SCAN — Arquivo de Alvos CDE
+# Formato: tipo  alvo  label
+# Tipos: web | infra | both
+# ═══════════════════════════════════════════════════════════════
+
+# ── Web Applications (Payment Gateway, APIs) ──
+
+web   api.domain.exemple1.com  
+web   api.domain.exemple2.com
+web   api.domain.exemple3.com
+
+
+
+# ── Infrastructure (Database, App Servers) ──
+infra  IP1
+infra  IP2
+infra  IP3
