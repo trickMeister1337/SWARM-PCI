@@ -75,7 +75,7 @@ nmap → testssl → curl/ssh → auth scan → nuclei → OWASP ZAP → HTML re
 ### Quick setup on Ubuntu 22.04+
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/swarm-pci.git
+git clone https://github.com/trickMeister1337/swarm-pci.git
 cd swarm-pci
 chmod +x pci_scan.sh setup_ubuntu.sh
 sudo bash setup_ubuntu.sh
@@ -381,7 +381,7 @@ Contributions are welcome. Please:
 ### Development setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/swarm-pci.git
+git clone https://github.com/trickMeister1337/swarm-pci.git
 cd swarm-pci
 sudo bash setup_ubuntu.sh
 bash pci_scan.sh -t https://your-test-target.com -p web-only
@@ -424,7 +424,7 @@ bash pci_scan.sh -t https://your-test-target.com -p web-only
 
 <div align="center">
 
-**Built by [Omnibees Security Intelligence](https://github.com/YOUR_USERNAME)** 🐝
+**Built by [trickMeister](https://github.com/trickMeister1337NAME)** 🐝
 
 *Part of the SWARM security toolkit*
 
