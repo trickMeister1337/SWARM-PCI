@@ -17,14 +17,14 @@ BOLD='\033[1m'; NC='\033[0m'
 # ─── Configuration ───
 ZAP_PORT=8081
 ZAP_HOST="127.0.0.1"
-ZAP_SPIDER_TIMEOUT=600      # 10 minutos
-ZAP_SCAN_TIMEOUT=1800       # 30 minutos
+ZAP_SPIDER_TIMEOUT=0
+ZAP_SCAN_TIMEOUT=0
 ZAP_STARTUP_TIMEOUT=180
 NUCLEI_RATE_LIMIT=30
 NUCLEI_CONCURRENCY=5
 NMAP_TIMING="T3"
 TESTSSL_TIMEOUT=300
-MAX_PARALLEL=8
+MAX_PARALLEL=8              # Paralelismo máximo entre hosts
 SCAN_DATE=$(date +"%Y%m%d_%H%M%S")
 SCAN_DATE_HUMAN=$(date +"%d/%m/%Y %H:%M:%S")
 QUARTER=$(date +"%Y-Q$(( ($(date +%-m) - 1) / 3 + 1 ))")
@@ -38,7 +38,7 @@ done
 IS_ROOT=0
 [[ "$(id -u)" -eq 0 ]] && IS_ROOT=1
 
-# ─── Initialize timer var ───
+# ─── Initialize timer var to avoid set -u errors ───
 PHASE_START=0
 
 # ═══════════════════════════════════════════════════════════════
@@ -50,19 +50,33 @@ usage() {
     echo -e "  ${CYAN}Uso:${NC}"
     echo "    bash pci_scan.sh -f <targets_file> [opções]"
     echo "    bash pci_scan.sh -t <target> [opções]"
-    echo "    bash pci_scan.sh -c <config.yaml> [opções]"
     echo ""
     echo -e "  ${CYAN}Opções:${NC}"
     echo "    -f FILE    Arquivo com lista de alvos (um por linha)"
     echo "    -t TARGET  Alvo único (IP, CIDR ou URL)"
-    echo "    -c CONFIG  Arquivo de configuração YAML"
     echo "    -o DIR     Diretório de output (default: pci_scan_YYYYMMDD)"
     echo "    -p PROFILE Perfil: full|quick|web-only|infra-only (default: full)"
+    echo "    -c FILE    Arquivo de credenciais para scan autenticado (Req 11.3.1.2)"
     echo "    --no-zap   Pular OWASP ZAP"
     echo "    --no-nuclei Pular Nuclei"
-    echo "    --no-lynis Pular Lynis (hardening)"
-    echo "    --no-trivy Pular Trivy (CVEs)"
     echo "    -h         Mostrar ajuda"
+    echo ""
+    echo -e "  ${CYAN}Formato do arquivo de alvos:${NC}"
+    echo "    # Comentários começam com #"
+    echo "    # Tipo: web | infra | both"
+    echo "    web  https://payments.example.com    CDE-Web-Gateway"
+    echo "    infra 10.0.1.0/24                    CDE-Database-Segment"
+    echo "    both  192.168.1.50                   CDE-App-Server"
+    echo ""
+    echo -e "  ${CYAN}Formato do arquivo de credenciais (Req 11.3.1.2):${NC}"
+    echo "    # service  host            port  username  password"
+    echo "    ssh        192.168.1.50    22    scanner   P@ssw0rd"
+    echo "    http       payments.ex.com 443   admin     admin123"
+    echo ""
+    echo -e "  ${CYAN}Exemplos:${NC}"
+    echo "    bash pci_scan.sh -f cde_targets.txt"
+    echo "    bash pci_scan.sh -t https://pay.omnibees.com -p web-only"
+    echo "    bash pci_scan.sh -f targets.txt -c creds.txt -p full"
     exit 0
 }
 
@@ -88,14 +102,18 @@ timer_end() {
     echo -e "${GREEN}[✓] Fase concluída em ${elapsed}s${NC}"
 }
 
+# Extract domain from URL
 extract_domain() {
     echo "$1" | sed -E 's|https?://||;s|/.*||;s|:.*||'
 }
 
+# Check if target is URL
 is_url() { [[ "$1" =~ ^https?:// ]]; }
+
+# Check if target is CIDR
 is_cidr() { [[ "$1" =~ /[0-9]+$ ]]; }
 
-# ZAP API helper
+# ZAP API helper (reused from SWARM)
 zap_api_call() {
     local endpoint="$1" params="${2:-}"
     local url="http://${ZAP_HOST}:${ZAP_PORT}/JSON/${endpoint}/"
@@ -119,41 +137,20 @@ wait_for_zap() {
     return 1
 }
 
-# Melhorada: detecta progresso estagnado e cancela o scan automaticamente
 wait_for_zap_progress() {
     local endpoint="$1" scan_id="$2" timeout="$3" label="$4"
-    local elapsed=0 progress=0 last_progress=-1 stall_count=0
-
+    local elapsed=0 progress=0
     while true; do
         progress=$(zap_api_call "$endpoint" "scanId=${scan_id}" 2>/dev/null \
                    | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','0'))" 2>/dev/null || echo "0")
         progress=${progress:-0}
         printf "\r${BLUE}[*] ${label}: %s%%${NC}  " "$progress"
-
         [[ "$progress" == "100" ]] && break
-
-        # Se ficar 5 iterações (50s) sem mudar o progresso, assume travamento
-        if [[ "$progress" == "$last_progress" ]]; then
-            stall_count=$((stall_count + 1))
-        else
-            stall_count=0
-        fi
-        last_progress=$progress
-
-        if [[ $stall_count -ge 5 ]]; then
-            echo ""
-            log_warn "${label} parece travado (progresso estagnado em ${progress}%). Cancelando scan..."
-            zap_api_call "${endpoint%/*}/action/stop" "scanId=${scan_id}" >/dev/null 2>&1
-            return 1
-        fi
-
         if [[ "$timeout" -gt 0 && "$elapsed" -ge "$timeout" ]]; then
             echo ""
-            log_warn "${label} timeout após ${timeout}s"
-            zap_api_call "${endpoint%/*}/action/stop" "scanId=${scan_id}" >/dev/null 2>&1
+            log_warn "${label} timeout após ${timeout}s (progresso: ${progress}%)"
             return 1
         fi
-
         sleep 10
         elapsed=$((elapsed + 10))
     done
@@ -172,62 +169,23 @@ PROFILE="full"
 CREDS_FILE=""
 SKIP_ZAP=0
 SKIP_NUCLEI=0
-SKIP_LYNIS=0
-SKIP_TRIVY=0
-CONFIG_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -f) TARGETS_FILE="$2"; shift 2 ;;
         -t) SINGLE_TARGET="$2"; shift 2 ;;
-        -c) CONFIG_FILE="$2"; shift 2 ;;
         -o) OUTDIR="$2"; shift 2 ;;
         -p) PROFILE="$2"; shift 2 ;;
+        -c) CREDS_FILE="$2"; shift 2 ;;
         --no-zap) SKIP_ZAP=1; shift ;;
         --no-nuclei) SKIP_NUCLEI=1; shift ;;
-        --no-lynis) SKIP_LYNIS=1; shift ;;
-        --no-trivy) SKIP_TRIVY=1; shift ;;
         -h|--help) usage ;;
         *) echo "Opção desconhecida: $1"; usage ;;
     esac
 done
 
-# ─── Load configuration from YAML if provided ───
-if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
-    if command -v yq &>/dev/null; then
-        log_info "Carregando configuração de $CONFIG_FILE"
-        [[ -z "$TARGETS_FILE" && -z "$SINGLE_TARGET" ]] && {
-            TARGETS_FILE=$(yq -r '.targets.file // ""' "$CONFIG_FILE")
-            SINGLE_TARGET=$(yq -r '.targets.single // ""' "$CONFIG_FILE")
-        }
-        [[ -z "$OUTDIR" ]] && OUTDIR=$(yq -r '.scan.output_dir // ""' "$CONFIG_FILE")
-        [[ "$PROFILE" == "full" ]] && PROFILE=$(yq -r '.scan.profile // "full"' "$CONFIG_FILE")
-        MAX_PARALLEL=$(yq -r '.scan.max_parallel // 8' "$CONFIG_FILE")
-        NMAP_TIMING=$(yq -r '.scan.nmap_timing // "T3"' "$CONFIG_FILE")
-        [[ $SKIP_ZAP -eq 0 ]] && {
-            ZAP_ENABLED=$(yq -r '.scan.zap.enabled // true' "$CONFIG_FILE")
-            [[ "$ZAP_ENABLED" == "false" ]] && SKIP_ZAP=1
-        }
-        [[ $SKIP_NUCLEI -eq 0 ]] && {
-            NUCLEI_ENABLED=$(yq -r '.scan.nuclei.enabled // true' "$CONFIG_FILE")
-            [[ "$NUCLEI_ENABLED" == "false" ]] && SKIP_NUCLEI=1
-        }
-        [[ $SKIP_LYNIS -eq 0 ]] && {
-            LYNIS_ENABLED=$(yq -r '.scan.lynis.enabled // true' "$CONFIG_FILE")
-            [[ "$LYNIS_ENABLED" == "false" ]] && SKIP_LYNIS=1
-        }
-        [[ $SKIP_TRIVY -eq 0 ]] && {
-            TRIVY_ENABLED=$(yq -r '.scan.trivy.enabled // true' "$CONFIG_FILE")
-            [[ "$TRIVY_ENABLED" == "false" ]] && SKIP_TRIVY=1
-        }
-        [[ -z "$CREDS_FILE" ]] && CREDS_FILE=$(yq -r '.scan.authenticated_scan.creds_file // ""' "$CONFIG_FILE")
-    else
-        log_warn "yq não encontrado, ignorando $CONFIG_FILE"
-    fi
-fi
-
 if [[ -z "$TARGETS_FILE" && -z "$SINGLE_TARGET" ]]; then
-    echo -e "${RED}Erro: Especifique -f <arquivo> ou -t <alvo> ou -c <config.yaml>${NC}"
+    echo -e "${RED}Erro: Especifique -f <arquivo> ou -t <alvo>${NC}"
     usage
 fi
 
@@ -271,6 +229,7 @@ elif [[ -n "$TARGETS_FILE" ]]; then
                 INFRA_TARGETS+=("$local_target")
                 ;;
             *)
+                # Auto-detect: URL → web, IP/CIDR → infra
                 if is_url "$local_target"; then
                     WEB_TARGETS+=("$local_target")
                 else
@@ -283,6 +242,7 @@ fi
 
 TOTAL_TARGETS=$(( ${#WEB_TARGETS[@]} + ${#INFRA_TARGETS[@]} ))
 
+# Apply profile filters
 case "$PROFILE" in
     web-only) INFRA_TARGETS=() ;;
     infra-only) WEB_TARGETS=(); SKIP_ZAP=1 ;;
@@ -314,6 +274,7 @@ echo -e "${BOLD}[+] Autenticado:${NC} $([ -n "$CREDS_FILE" ] && echo "Sim (Req 1
 echo -e "${BOLD}[+] Diretório  :${NC} $OUTDIR"
 echo -e "${BOLD}[+] Iniciado   :${NC} $SCAN_DATE_HUMAN"
 
+# Save scan metadata
 cat > "$OUTDIR/raw/scan_meta.json" << METAEOF
 {
   "scan_date": "$SCAN_DATE_HUMAN",
@@ -362,10 +323,8 @@ check_tool "nuclei" "optional"
 check_tool "zaproxy" "optional"
 check_tool "nikto" "optional"
 check_tool "sshpass" "optional"
-check_tool "lynis" "optional"
-check_tool "trivy" "optional"
-check_tool "yq" "optional"
 
+# Detect testssl command
 TESTSSL_CMD=""
 if command -v testssl.sh &>/dev/null; then
     TESTSSL_CMD="testssl.sh"
@@ -381,6 +340,7 @@ fi
 # ═══════════════════════════════════════════════════════════════
 #  FINDINGS COLLECTOR
 # ═══════════════════════════════════════════════════════════════
+# All findings go into a single JSONL file for report generation
 FINDINGS_FILE="$OUTDIR/raw/findings.jsonl"
 > "$FINDINGS_FILE"
 
@@ -388,6 +348,7 @@ add_finding() {
     local severity="$1" pci_req="$2" title="$3" target="$4" \
           detail="$5" evidence="${6:-}" remediation="${7:-}" \
           tool="${8:-manual}" cve="${9:-}" cvss="${10:-0.0}"
+    # flock garante escrita atômica quando múltiplos hosts rodam em paralelo
     (
         flock -x 200
         python3 -c "
@@ -432,8 +393,10 @@ if [[ ${#ALL_TARGETS[@]} -eq 0 ]]; then
     exit 1
 fi
 
+# Full port scan with service detection
 NMAP_PORTS="21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,6379,8080,8443,8888,9090,9200,9300,11211,27017"
 
+# -sS (SYN) requer root; fallback para -sT (TCP connect) sem root
 if [[ $IS_ROOT -eq 1 ]]; then
     NMAP_SCAN_TYPE="-sS"
 else
@@ -441,9 +404,11 @@ else
     log_warn "Executando como não-root — usando TCP connect scan (-sT). Para SYN scan, execute com sudo."
 fi
 
+# Exportar variáveis necessárias para subshells paralelas
 export OUTDIR FINDINGS_FILE NMAP_PORTS NMAP_SCAN_TYPE NMAP_TIMING
 export RED GREEN YELLOW BLUE CYAN NC BOLD
 
+# Função que processa um host (executada em paralelo via xargs)
 _phase1_process_host() {
     local host="$1"
     local NMAP_OUT="$OUTDIR/raw/nmap_${host//[\/:]/_}.txt"
@@ -453,15 +418,20 @@ _phase1_process_host() {
 
     nmap $NMAP_SCAN_TYPE -sV -sC \
          -p "$NMAP_PORTS" \
-         --script="banner,ssl-cert,ssl-enum-ciphers,http-title,http-server-header,ftp-anon,ssh-auth-methods,smb-security-mode,rdp-enum-encryption" \
+         --script="banner,ssl-cert,ssl-enum-ciphers,http-title,http-server-header,ftp-anon,ssh-auth-methods" \
          -$NMAP_TIMING \
          --defeat-rst-ratelimit \
          -oN "$NMAP_OUT" \
          -oX "$NMAP_XML" \
-         "$host" >/dev/null 2>&1 || true
+         "$host" >/dev/null 2>"$OUTDIR/raw/nmap_${host//[\/:]/_}_err.log" || true
 
     if [[ ! -s "$NMAP_OUT" ]]; then
-        echo -e "${YELLOW}[!]${NC} [nmap] ${host} — sem resultados"
+        local errlog="$OUTDIR/raw/nmap_${host//[\/:]/_}_err.log"
+        if [[ -s "$errlog" ]]; then
+            echo -e "${YELLOW}[!]${NC} [nmap] ${host} — sem resultados. Erro: $(head -3 "$errlog" | tr '\n' ' ')"
+        else
+            echo -e "${YELLOW}[!]${NC} [nmap] ${host} — sem resultados"
+        fi
         return 0
     fi
 
@@ -469,6 +439,7 @@ _phase1_process_host() {
     open_ports=$(grep -c "open" "$NMAP_OUT" 2>/dev/null || echo 0)
     echo -e "${GREEN}[✓]${NC} [nmap] ${host} — ${open_ports} porta(s) aberta(s)"
 
+    # Analyze nmap results for PCI findings
     local INSECURE_SERVICES=("21/tcp:FTP" "23/tcp:Telnet" "25/tcp:SMTP" "111/tcp:RPCbind" "135/tcp:MS-RPC" "139/tcp:NetBIOS" "445/tcp:SMB" "5900/tcp:VNC")
     while IFS= read -r port_line; do
         local port_num svc svc_port svc_name svc_num
@@ -489,6 +460,7 @@ _phase1_process_host() {
         done
     done < <(grep "open" "$NMAP_OUT" 2>/dev/null | grep -v "^#\|^Nmap\|^Host\|^Service\|^PORT\|^Starting" || true)
 
+    # Req 2: Detect RDP without NLA
     if grep -qi "rdp.*open" "$NMAP_OUT" 2>/dev/null; then
         if ! grep -qi "CredSSP\|NLA" "$NMAP_OUT" 2>/dev/null; then
             add_finding "high" "Req 2.2" \
@@ -501,6 +473,7 @@ _phase1_process_host() {
         fi
     fi
 
+    # Req 2: Default FTP anonymous
     if grep -qi "ftp-anon: Anonymous FTP login allowed" "$NMAP_OUT" 2>/dev/null; then
         add_finding "critical" "Req 2.2" \
             "FTP anônimo habilitado" \
@@ -513,9 +486,10 @@ _phase1_process_host() {
 }
 export -f _phase1_process_host
 
+# Executa todos os hosts em paralelo (xargs -P $MAX_PARALLEL)
 log_info "Iniciando ${#ALL_TARGETS[@]} host(s) em paralelo (max ${MAX_PARALLEL})..."
 printf '%s\n' "${ALL_TARGETS[@]}" | \
-    xargs -n 1 -P "$MAX_PARALLEL" -I {} bash -c '_phase1_process_host "$@"' _ {}
+    xargs -I {} -P "$MAX_PARALLEL" bash -c '_phase1_process_host "$@"' _ {}
 
 timer_end
 
@@ -526,6 +500,7 @@ phase_header "2/7" "AUDITORIA TLS/SSL (Req 4)"
 timer_start
 
 if [[ -n "$TESTSSL_CMD" ]]; then
+    # Collect all HTTPS targets
     TLS_TARGETS=()
     for t in "${WEB_TARGETS[@]+"${WEB_TARGETS[@]}"}"; do
         TLS_TARGETS+=("$(extract_domain "$t")")
@@ -536,6 +511,7 @@ if [[ -n "$TESTSSL_CMD" ]]; then
         fi
     done
 
+    # Escrever o parser Python uma vez em arquivo (evita heredoc em subshells)
     TESTSSL_PARSER="$OUTDIR/raw/_parse_testssl.py"
     cat > "$TESTSSL_PARSER" << 'PYPARSER'
 import json, sys
@@ -653,7 +629,7 @@ PYPARSER
 
     log_info "Iniciando ${#TLS_TARGETS[@]} testssl em paralelo (max ${MAX_PARALLEL})..."
     printf '%s\n' "${TLS_TARGETS[@]}" | \
-        xargs -n 1 -P "$MAX_PARALLEL" -I {} bash -c '_phase2_process_host "$@"' _ {}
+        xargs -I {} -P "$MAX_PARALLEL" bash -c '_phase2_process_host "$@"' _ {}
 else
     log_skip "testssl não disponível — auditoria TLS/SSL ignorada"
 fi
@@ -661,7 +637,7 @@ fi
 timer_end
 
 # ═══════════════════════════════════════════════════════════════
-#  FASE 3: CONFIGURATION AUDIT (Req 2) — PARALELO (OTIMIZADA COM XML)
+#  FASE 3: CONFIGURATION AUDIT (Req 2) — PARALELO
 # ═══════════════════════════════════════════════════════════════
 phase_header "3/7" "AUDITORIA DE CONFIGURAÇÃO (Req 2)"
 timer_start
@@ -670,86 +646,70 @@ _phase3_process_host() {
     local host="$1"
     echo -e "${BLUE}[*]${NC} [config] ${host}..."
 
-    local NMAP_XML="$OUTDIR/raw/nmap_${host//[\/:]/_}.xml"
-    if [[ ! -f "$NMAP_XML" ]]; then
-        echo -e "${YELLOW}[!]${NC} XML do nmap não encontrado para $host, pulando config"
-        return
-    fi
+    local NMAP_FILE="$OUTDIR/raw/nmap_${host//[\/:]/_}.txt"
+    local HTTP_PORTS=()
+    local port PROTO HEADERS SERVER_HDR POWERED_HDR MISSING_HEADERS local_sev
 
-    local http_ports=$(python3 -c "
-import xml.etree.ElementTree as ET
-tree = ET.parse('$NMAP_XML')
-root = tree.getroot()
-ports = []
-for port in root.findall('.//port'):
-    if port.find('state').get('state') == 'open':
-        service = port.find('service')
-        if service is not None:
-            name = service.get('name', '')
-            if name in ('http', 'https', 'http-alt', 'ssl/http'):
-                ports.append((port.get('portid'), name))
-print(','.join([f'{p}:{s}' for p,s in ports]))
-" 2>/dev/null)
+    for port in 80 443 8080 8443; do
+        if grep -q "${port}/tcp.*open" "$NMAP_FILE" 2>/dev/null; then
+            HTTP_PORTS+=("$port")
+        fi
+    done
+    [[ ${#HTTP_PORTS[@]} -eq 0 ]] && HTTP_PORTS=(80 443)
 
-    if [[ -z "$http_ports" ]]; then
-        echo -e "${GREEN}[✓]${NC} [config] ${host} sem portas HTTP abertas"
-    else
-        IFS=',' read -ra PORT_ARRAY <<< "$http_ports"
-        for entry in "${PORT_ARRAY[@]}"; do
-            port="${entry%:*}"
-            svc="${entry#*:}"
-            PROTO="http"
-            [[ "$svc" == "https" || "$svc" == "ssl/http" ]] && PROTO="https"
+    for port in "${HTTP_PORTS[@]}"; do
+        PROTO="http"
+        [[ "$port" == "443" || "$port" == "8443" ]] && PROTO="https"
 
-            HEADERS=$(curl -skI --connect-timeout 3 --max-time 5 "${PROTO}://${host}:${port}" 2>/dev/null || true)
-            [[ -z "$HEADERS" ]] && continue
+        HEADERS=$(curl -skI --connect-timeout 3 --max-time 5 "${PROTO}://${host}:${port}" 2>/dev/null || true)
+        [[ -z "$HEADERS" ]] && continue
 
-            SERVER_HDR=$(echo "$HEADERS" | grep -i "^server:" | head -1 || true)
-            if [[ -n "$SERVER_HDR" ]] && echo "$SERVER_HDR" | grep -qiE "[0-9]+\.[0-9]+"; then
-                add_finding "low" "Req 2.2.7" \
-                    "Server version disclosure: $(echo "$SERVER_HDR" | tr -d '\r')" \
-                    "${host}:${port}" \
-                    "O header Server expõe versão do software, facilitando ataques direcionados." \
-                    "$(echo "$SERVER_HDR" | tr -d '\r')" \
-                    "Remover versão do header Server. Ref: PCI DSS 4.0 Req 2.2.7" \
-                    "curl"
-            fi
+        SERVER_HDR=$(echo "$HEADERS" | grep -i "^server:" | head -1 || true)
+        if [[ -n "$SERVER_HDR" ]] && echo "$SERVER_HDR" | grep -qiE "[0-9]+\.[0-9]+"; then
+            add_finding "low" "Req 2.2.7" \
+                "Server version disclosure: $(echo "$SERVER_HDR" | tr -d '\r')" \
+                "${host}:${port}" \
+                "O header Server expõe versão do software, facilitando ataques direcionados." \
+                "$(echo "$SERVER_HDR" | tr -d '\r')" \
+                "Remover versão do header Server. Ref: PCI DSS 4.0 Req 2.2.7" \
+                "curl"
+        fi
 
-            POWERED_HDR=$(echo "$HEADERS" | grep -i "^x-powered-by:" | head -1 || true)
-            if [[ -n "$POWERED_HDR" ]]; then
-                add_finding "low" "Req 2.2.7" \
-                    "X-Powered-By disclosure: $(echo "$POWERED_HDR" | tr -d '\r')" \
-                    "${host}:${port}" \
-                    "O header X-Powered-By expõe tecnologia do backend." \
-                    "$(echo "$POWERED_HDR" | tr -d '\r')" \
-                    "Remover header X-Powered-By. Ref: PCI DSS 4.0 Req 2.2.7" \
-                    "curl"
-            fi
+        POWERED_HDR=$(echo "$HEADERS" | grep -i "^x-powered-by:" | head -1 || true)
+        if [[ -n "$POWERED_HDR" ]]; then
+            add_finding "low" "Req 2.2.7" \
+                "X-Powered-By disclosure: $(echo "$POWERED_HDR" | tr -d '\r')" \
+                "${host}:${port}" \
+                "O header X-Powered-By expõe tecnologia do backend." \
+                "$(echo "$POWERED_HDR" | tr -d '\r')" \
+                "Remover header X-Powered-By. Ref: PCI DSS 4.0 Req 2.2.7" \
+                "curl"
+        fi
 
-            MISSING_HEADERS=()
-            echo "$HEADERS" | grep -qi "strict-transport-security" || MISSING_HEADERS+=("Strict-Transport-Security")
-            echo "$HEADERS" | grep -qi "x-content-type-options" || MISSING_HEADERS+=("X-Content-Type-Options")
-            echo "$HEADERS" | grep -qi "x-frame-options\|content-security-policy.*frame-ancestors" || MISSING_HEADERS+=("X-Frame-Options")
-            echo "$HEADERS" | grep -qi "content-security-policy" || MISSING_HEADERS+=("Content-Security-Policy")
-            echo "$HEADERS" | grep -qi "x-xss-protection\|content-security-policy" || MISSING_HEADERS+=("X-XSS-Protection")
-            echo "$HEADERS" | grep -qi "referrer-policy" || MISSING_HEADERS+=("Referrer-Policy")
-            echo "$HEADERS" | grep -qi "permissions-policy\|feature-policy" || MISSING_HEADERS+=("Permissions-Policy")
+        MISSING_HEADERS=()
+        echo "$HEADERS" | grep -qi "strict-transport-security" || MISSING_HEADERS+=("Strict-Transport-Security")
+        echo "$HEADERS" | grep -qi "x-content-type-options" || MISSING_HEADERS+=("X-Content-Type-Options")
+        echo "$HEADERS" | grep -qi "x-frame-options\|content-security-policy.*frame-ancestors" || MISSING_HEADERS+=("X-Frame-Options")
+        echo "$HEADERS" | grep -qi "content-security-policy" || MISSING_HEADERS+=("Content-Security-Policy")
+        echo "$HEADERS" | grep -qi "x-xss-protection\|content-security-policy" || MISSING_HEADERS+=("X-XSS-Protection")
+        echo "$HEADERS" | grep -qi "referrer-policy" || MISSING_HEADERS+=("Referrer-Policy")
+        echo "$HEADERS" | grep -qi "permissions-policy\|feature-policy" || MISSING_HEADERS+=("Permissions-Policy")
 
-            if [[ ${#MISSING_HEADERS[@]} -gt 0 ]]; then
-                local_sev="medium"
-                [[ ${#MISSING_HEADERS[@]} -ge 4 ]] && local_sev="high"
-                add_finding "$local_sev" "Req 6.2.4" \
-                    "Security headers ausentes (${#MISSING_HEADERS[@]})" \
-                    "${PROTO}://${host}:${port}" \
-                    "Headers faltando: ${MISSING_HEADERS[*]}" \
-                    "$(echo "$HEADERS" | head -15)" \
-                    "Implementar todos os security headers recomendados. Ref: PCI DSS 4.0 Req 6.2.4, OWASP Secure Headers" \
-                    "curl"
-            fi
-        done
-    fi
+        if [[ ${#MISSING_HEADERS[@]} -gt 0 ]]; then
+            local_sev="medium"
+            [[ ${#MISSING_HEADERS[@]} -ge 4 ]] && local_sev="high"
+            add_finding "$local_sev" "Req 6.2.4" \
+                "Security headers ausentes (${#MISSING_HEADERS[@]})" \
+                "${PROTO}://${host}:${port}" \
+                "Headers faltando: ${MISSING_HEADERS[*]}" \
+                "$(echo "$HEADERS" | head -15)" \
+                "Implementar todos os security headers recomendados. Ref: PCI DSS 4.0 Req 6.2.4, OWASP Secure Headers" \
+                "curl"
+        fi
+    done
 
-    if grep -q "22/tcp.*open" "$OUTDIR/raw/nmap_${host//[\/:]/_}.txt" 2>/dev/null; then
+    # SSH Configuration Check
+    if grep -q "22/tcp.*open" "$NMAP_FILE" 2>/dev/null; then
         local SSH_OUT
         SSH_OUT=$(timeout 8 ssh -o BatchMode=yes \
                   -o ConnectTimeout=5 \
@@ -784,14 +744,14 @@ export -f _phase3_process_host
 
 log_info "Iniciando ${#ALL_TARGETS[@]} config audits em paralelo (max ${MAX_PARALLEL})..."
 printf '%s\n' "${ALL_TARGETS[@]}" | \
-    xargs -n 1 -P "$MAX_PARALLEL" -I {} bash -c '_phase3_process_host "$@"' _ {}
+    xargs -I {} -P "$MAX_PARALLEL" bash -c '_phase3_process_host "$@"' _ {}
 
 timer_end
 
 # ═══════════════════════════════════════════════════════════════
-#  FASE 4: AUTHENTICATED SCAN + LYNIS + TRIVY
+#  FASE 4: AUTHENTICATED SCAN (Req 11.3.1.2) — NEW in PCI 4.0
 # ═══════════════════════════════════════════════════════════════
-phase_header "4/7" "SCAN AUTENTICADO + HARDENING + CVEs (Req 11.3.1.2, 2.2, 6.3.3)"
+phase_header "4/7" "SCAN AUTENTICADO (Req 11.3.1.2)"
 timer_start
 
 if [[ -n "$CREDS_FILE" && -f "$CREDS_FILE" ]]; then
@@ -812,6 +772,7 @@ if [[ -n "$CREDS_FILE" && -f "$CREDS_FILE" ]]; then
             ssh)
                 log_info "SSH autenticado → ${CHOST}:${CPORT}..."
                 if command -v sshpass &>/dev/null; then
+                    # Authenticated nmap via SSH tunnel / local checks
                     AUTH_RESULT=$(sshpass -p "$CPASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
                         -p "$CPORT" "${CUSER}@${CHOST}" \
                         "uname -a; cat /etc/os-release 2>/dev/null; dpkg -l 2>/dev/null | head -50 || rpm -qa 2>/dev/null | head -50; ss -tlnp 2>/dev/null; cat /etc/ssh/sshd_config 2>/dev/null | grep -v '^#' | grep -v '^\$'" \
@@ -822,6 +783,7 @@ if [[ -n "$CREDS_FILE" && -f "$CREDS_FILE" ]]; then
                         echo "$AUTH_RESULT" > "$OUTDIR/evidence/auth_ssh_${CHOST//[\/:]/_}.txt"
                         AUTH_SCAN_COUNT=$((AUTH_SCAN_COUNT + 1))
 
+                        # Check for outdated packages (Req 6.3.3)
                         if echo "$AUTH_RESULT" | grep -qi "security\|CVE\|vuln"; then
                             add_finding "medium" "Req 6.3.3" \
                                 "Pacotes potencialmente desatualizados" \
@@ -832,6 +794,7 @@ if [[ -n "$CREDS_FILE" && -f "$CREDS_FILE" ]]; then
                                 "ssh-auth"
                         fi
 
+                        # Check sshd_config for weak settings
                         if echo "$AUTH_RESULT" | grep -qi "PermitRootLogin.*yes"; then
                             add_finding "high" "Req 2.2, 8.6" \
                                 "SSH permite login root" \
@@ -840,83 +803,6 @@ if [[ -n "$CREDS_FILE" && -f "$CREDS_FILE" ]]; then
                                 "PermitRootLogin yes" \
                                 "Definir PermitRootLogin no em /etc/ssh/sshd_config. Ref: PCI DSS 4.0 Req 8.6.1" \
                                 "ssh-auth"
-                        fi
-
-                        # Lynis
-                        if [[ ${SKIP_LYNIS} -eq 0 ]] && command -v lynis &>/dev/null; then
-                            log_info "Executando Lynis via SSH em ${CHOST}..."
-                            LYNIS_OUT="$OUTDIR/evidence/lynis_${CHOST//[\/:]/_}.txt"
-                            sshpass -p "$CPASS" ssh -o StrictHostKeyChecking=no -p "$CPORT" "${CUSER}@${CHOST}" \
-                                "lynis audit system --quick --no-colors" > "$LYNIS_OUT" 2>/dev/null
-
-                            if grep -q "Warning\|Suggestion" "$LYNIS_OUT"; then
-                                while IFS= read -r line; do
-                                    if [[ "$line" =~ ^Warning|^Suggestion ]]; then
-                                        add_finding "medium" "Req 2.2" \
-                                            "Lynis: $(echo "$line" | cut -d']' -f2- | xargs)" \
-                                            "$CHOST" \
-                                            "Hardening do sistema pode ser melhorado." \
-                                            "$line" \
-                                            "Aplicar recomendações do Lynis. Ref: PCI DSS 4.0 Req 2.2" \
-                                            "lynis"
-                                    fi
-                                done < <(grep -E "^(Warning|Suggestion)" "$LYNIS_OUT" | head -20)
-                            fi
-                            log_ok "Lynis concluído para ${CHOST}"
-                        fi
-
-                        # Trivy
-                        if [[ ${SKIP_TRIVY} -eq 0 ]] && command -v trivy &>/dev/null; then
-                            log_info "Executando Trivy (rootfs) via SSH em ${CHOST}..."
-                            TRIVY_OUT="$OUTDIR/raw/trivy_${CHOST//[\/:]/_}.json"
-                            sshpass -p "$CPASS" ssh -o StrictHostKeyChecking=no -p "$CPORT" "${CUSER}@${CHOST}" \
-                                "trivy rootfs --format json --exit-code 0 /" > "$TRIVY_OUT" 2>/dev/null
-
-                            if [[ -s "$TRIVY_OUT" ]]; then
-                                python3 - "$TRIVY_OUT" "$FINDINGS_FILE" "$CHOST" << 'TRIVYPARSE'
-import json, sys
-
-trivy_file = sys.argv[1]
-findings_file = sys.argv[2]
-host = sys.argv[3]
-
-try:
-    with open(trivy_file, 'r') as f:
-        data = json.load(f)
-except:
-    sys.exit(0)
-
-count = 0
-with open(findings_file, 'a') as ff:
-    for result in data.get('Results', []):
-        for vuln in result.get('Vulnerabilities', []):
-            sev = vuln.get('Severity', 'UNKNOWN').upper()
-            sev_map = {'CRITICAL':'critical', 'HIGH':'high', 'MEDIUM':'medium', 'LOW':'low'}
-            severity = sev_map.get(sev, 'info')
-            cve = vuln.get('VulnerabilityID', '')
-            title = f"{cve}: {vuln.get('Title', '')[:80]}"
-            detail = vuln.get('Description', '')
-            fixed = vuln.get('FixedVersion', 'N/A')
-            remediation = f"Atualizar para versão corrigida: {fixed}. Ref: PCI DSS 4.0 Req 6.3.3"
-            finding = {
-                'severity': severity,
-                'pci_req': 'Req 6.3.3',
-                'title': title,
-                'target': host,
-                'detail': detail,
-                'evidence': f"CVE: {cve}",
-                'remediation': remediation,
-                'tool': 'trivy',
-                'cve': cve,
-                'cvss': 0.0
-            }
-            ff.write(json.dumps(finding) + '\n')
-            count += 1
-
-print(f"  -> {count} findings Trivy para {host}")
-TRIVYPARSE
-                            fi
-                            log_ok "Trivy concluído para ${CHOST}"
                         fi
                     else
                         log_warn "Falha na autenticação SSH: ${CHOST}"
@@ -942,6 +828,8 @@ TRIVYPARSE
     done < "$CREDS_FILE"
 
     log_ok "${AUTH_SCAN_COUNT} scan(s) autenticado(s) concluído(s)"
+
+    # Document systems that couldn't be authenticated (Req 11.3.1.2 requirement)
     echo "$AUTH_SCAN_COUNT" > "$OUTDIR/raw/auth_scan_count.txt"
 else
     log_warn "Sem arquivo de credenciais — scan autenticado não executado"
@@ -958,16 +846,18 @@ fi
 timer_end
 
 # ═══════════════════════════════════════════════════════════════
-#  FASE 5: VULNERABILITY SCAN — NUCLEI
+#  FASE 5: VULNERABILITY SCAN (Req 6, 11)
 # ═══════════════════════════════════════════════════════════════
-phase_header "5/7" "SCAN DE VULNERABILIDADES (NUCLEI - Req 6, 11)"
+phase_header "5/7" "SCAN DE VULNERABILIDADES (Req 6, 11)"
 timer_start
 
 if command -v nuclei &>/dev/null && [[ $SKIP_NUCLEI -eq 0 ]]; then
     log_info "Nuclei scan com templates PCI-relevantes (modo multi-target)..."
 
+    # PCI-specific nuclei tags
     PCI_TAGS="cve,default-login,misconfig,exposure,tech,token,unauth,sqli,xss,rce,lfi,rfi,ssrf,ssti,idor"
 
+    # Build consolidated target list (use URL if available, else host)
     NUCLEI_TARGETS_FILE="$OUTDIR/raw/_nuclei_targets.txt"
     > "$NUCLEI_TARGETS_FILE"
     for target in "${ALL_TARGETS[@]}"; do
@@ -984,6 +874,8 @@ if command -v nuclei &>/dev/null && [[ $SKIP_NUCLEI -eq 0 ]]; then
     log_info "Executando nuclei em ${#ALL_TARGETS[@]} alvo(s) simultaneamente..."
     NUCLEI_OUT="$OUTDIR/raw/nuclei_all.json"
 
+    # Nuclei já paraleliza internamente quando recebe -l (list)
+    # -bs (bulk-size) = alvos em paralelo; -c (concurrency) = templates em paralelo por alvo
     nuclei -l "$NUCLEI_TARGETS_FILE" \
            -tags "$PCI_TAGS" \
            -rate-limit "$NUCLEI_RATE_LIMIT" \
@@ -1009,6 +901,7 @@ if command -v nuclei &>/dev/null && [[ $SKIP_NUCLEI -eq 0 ]]; then
 
     log_ok "nuclei: ${NUCLEI_COUNT} finding(s) total"
 
+    # Parse nuclei findings into PCI format
     if [[ "$NUCLEI_COUNT" -gt 0 ]]; then
         python3 - "$NUCLEI_OUT" "$FINDINGS_FILE" << 'PYEOF'
 import json, sys
@@ -1097,23 +990,27 @@ fi
 timer_end
 
 # ═══════════════════════════════════════════════════════════════
-#  FASE 6: WEB APPLICATION SCAN — OWASP ZAP (Req 6) - COM AJUSTES
+#  FASE 6: WEB APPLICATION SCAN (Req 6)
 # ═══════════════════════════════════════════════════════════════
 phase_header "6/7" "SCAN DE APLICAÇÃO WEB — OWASP ZAP (Req 6)"
 timer_start
 
 if command -v zaproxy &>/dev/null && [[ $SKIP_ZAP -eq 0 ]] && [[ ${#WEB_TARGETS[@]} -gt 0 ]]; then
 
+    # Start ZAP or reuse existing
     ZAP_STARTED_BY_SCRIPT=0
     if zap_api_call "core/view/version" "" 2>/dev/null | grep -q "version"; then
         log_ok "ZAP já rodando — reutilizando"
     else
+        # Kill stale ZAP
         pkill -f "zaproxy.*-daemon" 2>/dev/null || true
         rm -f "$HOME/.ZAP/zap.lock" 2>/dev/null || true
         sleep 2
 
+        # Patch ZAP config for API access
         ZAP_CONFIG="$HOME/.ZAP/config.xml"
         if [[ -f "$ZAP_CONFIG" ]]; then
+            # Add 127.0.0.1 and localhost to allowed addrs if not already present
             grep -q "<n>127.0.0.1</n>" "$ZAP_CONFIG" 2>/dev/null || \
                 sed -i 's|</addrs>|<n>127.0.0.1</n></addrs>|g' "$ZAP_CONFIG" 2>/dev/null || true
             grep -q "<n>localhost</n>" "$ZAP_CONFIG" 2>/dev/null || \
@@ -1127,8 +1024,6 @@ if command -v zaproxy &>/dev/null && [[ $SKIP_ZAP -eq 0 ]] && [[ ${#WEB_TARGETS[
                 -config api.disablekey=true \
                 -config api.addrs.addr.name=127.0.0.1 \
                 -config api.addrs.addr.regex=true \
-                -config connection.dnsTtlSuccessfulQueries=-1 \
-                -config certificate.ignoreErrors=true \
                 > "$OUTDIR/raw/zap_daemon.log" 2>&1 &
 
         ZAP_STARTED_BY_SCRIPT=1
@@ -1140,53 +1035,25 @@ if command -v zaproxy &>/dev/null && [[ $SKIP_ZAP -eq 0 ]] && [[ ${#WEB_TARGETS[
     fi
 
     if zap_api_call "core/view/version" "" 2>/dev/null | grep -q "version"; then
-        # Determinar se devemos executar spider ou pular
-        # Se não houver credenciais configuradas para este alvo, pulamos o spider
-        HAS_AUTH_FOR_HOST() {
-            local host="$1"
-            if [[ -n "$CREDS_FILE" && -f "$CREDS_FILE" ]]; then
-                # Verificar se existe entrada http/https para este host
-                grep -qE "^(http|https)\s+${host}(\s+|$)" "$CREDS_FILE" 2>/dev/null
-                return $?
-            fi
-            return 1
-        }
-
         for web_target in "${WEB_TARGETS[@]}"; do
             log_info "ZAP scan → ${web_target}..."
 
             ENCODED_URL=$(python3 -c \
                 "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$web_target")
-            TARGET_HOST=$(extract_domain "$web_target")
 
-            # Decidir se executa spider
-            if HAS_AUTH_FOR_HOST "$TARGET_HOST" || [[ "$web_target" == *"auth."* ]]; then
-                log_warn "Alvo parece exigir autenticação (ou auth.bee2pay.com). Pulando Spider para evitar travamento."
-                SKIP_SPIDER_FOR_THIS=1
-            else
-                SKIP_SPIDER_FOR_THIS=0
-            fi
+            # Spider
+            log_info "Spider..."
+            SPIDER_ID=$(zap_api_call "spider/action/scan" "url=${ENCODED_URL}" \
+                        | python3 -c "import sys,json; print(json.load(sys.stdin).get('scan','0'))" 2>/dev/null)
+            wait_for_zap_progress "spider/view/status" "${SPIDER_ID:-0}" "$ZAP_SPIDER_TIMEOUT" "Spider"
 
-            if [[ $SKIP_SPIDER_FOR_THIS -eq 0 ]]; then
-                log_info "Spider..."
-                SPIDER_ID=$(zap_api_call "spider/action/scan" "url=${ENCODED_URL}" \
-                            | python3 -c "import sys,json; print(json.load(sys.stdin).get('scan','0'))" 2>/dev/null)
-
-                if wait_for_zap_progress "spider/view/status" "${SPIDER_ID:-0}" "$ZAP_SPIDER_TIMEOUT" "Spider"; then
-                    log_ok "Spider concluído com sucesso"
-                else
-                    log_warn "Spider falhou ou foi cancelado. Prosseguindo com Active Scan mesmo assim..."
-                fi
-            else
-                log_info "Spider ignorado (alvo exige autenticação ou sem credenciais)."
-            fi
-
-            # Active Scan sempre executa
+            # Active Scan
             log_info "Active Scan..."
             SCAN_ID=$(zap_api_call "ascan/action/scan" "url=${ENCODED_URL}&recurse=true" \
                       | python3 -c "import sys,json; print(json.load(sys.stdin).get('scan','0'))" 2>/dev/null)
             wait_for_zap_progress "ascan/view/status" "${SCAN_ID:-0}" "$ZAP_SCAN_TIMEOUT" "Active Scan"
 
+            # Collect alerts
             ZAP_ALERTS="$OUTDIR/raw/zap_${web_target//[\/:]/_}.json"
             curl -s "http://${ZAP_HOST}:${ZAP_PORT}/JSON/core/view/alerts/?baseurl=${ENCODED_URL}" \
                 > "$ZAP_ALERTS" 2>/dev/null
@@ -1194,6 +1061,7 @@ if command -v zaproxy &>/dev/null && [[ $SKIP_ZAP -eq 0 ]] && [[ ${#WEB_TARGETS[
             ALERT_COUNT=$(python3 -c "import json; d=json.load(open('$ZAP_ALERTS')); print(len(d.get('alerts',[])))" 2>/dev/null || echo "0")
             log_ok "ZAP: ${ALERT_COUNT} alerta(s) para ${web_target}"
 
+            # Parse ZAP alerts into PCI format
             python3 - "$ZAP_ALERTS" "$FINDINGS_FILE" << 'PYEOF'
 import json, sys
 
@@ -1201,11 +1069,18 @@ zap_file = sys.argv[1]
 findings_file = sys.argv[2]
 
 risk_map = {'3': 'critical', '2': 'high', '1': 'medium', '0': 'low'}
+# CWE → PCI requirement mapping
 cwe_pci_map = {
-    '89': 'Req 6.2.4', '79': 'Req 6.2.4', '22': 'Req 6.2.4',
-    '352': 'Req 6.2.4', '200': 'Req 2.2.7', '614': 'Req 4.2.1',
-    '693': 'Req 6.2.4', '16': 'Req 2.2', '525': 'Req 6.2.4',
-    '829': 'Req 6.2.4',
+    '89': 'Req 6.2.4',    # SQL Injection
+    '79': 'Req 6.2.4',    # XSS
+    '22': 'Req 6.2.4',    # Path Traversal
+    '352': 'Req 6.2.4',   # CSRF
+    '200': 'Req 2.2.7',   # Information Exposure
+    '614': 'Req 4.2.1',   # Secure Cookie
+    '693': 'Req 6.2.4',   # Protection Mechanism Failure
+    '16': 'Req 2.2',      # Configuration
+    '525': 'Req 6.2.4',   # Browser Cache
+    '829': 'Req 6.2.4',   # Inclusion
 }
 
 try:
@@ -1221,8 +1096,11 @@ with open(findings_file, 'a') as ff:
     for alert in alerts:
         risk = str(alert.get('risk', '0'))
         severity = risk_map.get(risk, 'info')
+
         cwe_id = str(alert.get('cweid', ''))
         pci_req = cwe_pci_map.get(cwe_id, 'Req 6.2.4')
+
+        # Extract CVE from references
         cve = ''
         refs = alert.get('reference', '')
         if 'CVE-' in refs:
@@ -1230,6 +1108,7 @@ with open(findings_file, 'a') as ff:
             cve_match = re.search(r'(CVE-\d{4}-\d+)', refs)
             if cve_match:
                 cve = cve_match.group(1)
+
         finding = {
             'severity': severity,
             'pci_req': pci_req,
@@ -1249,6 +1128,7 @@ print(f"  → {count} finding(s) ZAP mapeados para PCI")
 PYEOF
         done
 
+        # Shutdown ZAP if we started it
         if [[ $ZAP_STARTED_BY_SCRIPT -eq 1 ]]; then
             zap_api_call "core/action/shutdown" "" 2>/dev/null || true
             log_info "ZAP encerrado"
@@ -1274,7 +1154,7 @@ timer_start
 
 REPORT_FILE="$OUTDIR/relatorio_pci_dss.html"
 
-python3 - "$FINDINGS_FILE" "$REPORT_FILE" "$OUTDIR/raw/scan_meta.json" "$QUARTER" "$MAX_PARALLEL" << 'PYREPORT'
+python3 - "$FINDINGS_FILE" "$REPORT_FILE" "$OUTDIR/raw/scan_meta.json" "$QUARTER" << 'PYREPORT'
 import json, sys, html as htmlmod
 from collections import Counter, defaultdict
 
@@ -1282,39 +1162,71 @@ findings_file = sys.argv[1]
 report_file = sys.argv[2]
 meta_file = sys.argv[3]
 quarter = sys.argv[4]
-max_parallel = sys.argv[5]
 
 with open(meta_file) as f:
     meta = json.load(f)
 
-findings = []
+raw_findings = []
 with open(findings_file) as f:
     for line in f:
         line = line.strip()
         if line:
             try:
-                findings.append(json.loads(line))
+                raw_findings.append(json.loads(line))
             except:
                 pass
 
-seen = set()
-deduped = []
-for fi in findings:
-    key = (fi.get('title',''), fi.get('target',''))
-    if key not in seen:
-        seen.add(key)
-        deduped.append(fi)
-findings = deduped
+total_occurrences = len(raw_findings)
 
+# ═══════════════════════════════════════════════════════════════
+# CONSOLIDAÇÃO: agrupa findings por título → 1 card por tipo
+# Padrão Big4: "Missing HSTS" em 8 URLs = 1 card médio (8 ocorrências)
+# ═══════════════════════════════════════════════════════════════
+card_map = {}  # key: (title, severity) → card dict
+
+for fi in raw_findings:
+    title = fi.get('title', '(sem título)')
+    sev = fi.get('severity', 'info')
+    key = (title, sev)
+
+    if key not in card_map:
+        card_map[key] = {
+            'title': title,
+            'severity': sev,
+            'pci_req': fi.get('pci_req', ''),
+            'detail': fi.get('detail', ''),
+            'evidence': fi.get('evidence', ''),
+            'remediation': fi.get('remediation', ''),
+            'tool': fi.get('tool', ''),
+            'cve': fi.get('cve', ''),
+            'cvss': fi.get('cvss', 0.0),
+            'targets': [],
+        }
+    target = fi.get('target', '')
+    if target and target not in card_map[key]['targets']:
+        card_map[key]['targets'].append(target)
+    # Keep richest evidence/detail
+    if fi.get('evidence') and len(fi['evidence']) > len(card_map[key]['evidence']):
+        card_map[key]['evidence'] = fi['evidence']
+    if fi.get('cvss', 0) > card_map[key]['cvss']:
+        card_map[key]['cvss'] = fi['cvss']
+    if fi.get('cve') and not card_map[key]['cve']:
+        card_map[key]['cve'] = fi['cve']
+
+cards = list(card_map.values())
+
+# ── Stats baseados em CARDS (não ocorrências) ──
 sev_order = ['critical', 'high', 'medium', 'low', 'info']
-sev_counts = Counter(fi.get('severity','info') for fi in findings)
+sev_counts = Counter(c['severity'] for c in cards)
 sev_labels_map = {'critical':'CRÍTICO','high':'ALTO','medium':'MÉDIO','low':'BAIXO','info':'INFO'}
 sev_colors = {'critical':'#7a2e2e','high':'#b34e4e','medium':'#d4833a','low':'#4a7c8c','info':'#6e8f72'}
+total_cards = len(cards)
 
+# ── Group cards by PCI requirement ──
 req_groups = defaultdict(list)
-for fi in findings:
-    primary_req = fi.get('pci_req','Outros').split(',')[0].strip()
-    req_groups[primary_req].append(fi)
+for c in cards:
+    primary_req = c.get('pci_req', 'Outros').split(',')[0].strip()
+    req_groups[primary_req].append(c)
 
 req_meta = {
     'Req 1.3': ('Req 1.3 — Controles de Segurança de Rede', 'Acesso ao CDE restrito, NSC configurados'),
@@ -1335,45 +1247,36 @@ req_meta = {
     'Req 2.2, 8.6': ('Req 2.2, 8.6 — Config + Contas', 'Login root, contas administrativas'),
 }
 
-def req_status(req_findings):
-    c = sum(1 for fi in req_findings if fi.get('severity') == 'critical')
-    h = sum(1 for fi in req_findings if fi.get('severity') == 'high')
-    m = sum(1 for fi in req_findings if fi.get('severity') == 'medium')
-    if c + h > 0:
-        return 'FAIL', '#7a2e2e'
-    elif m > 0:
-        return 'REVIEW', '#d4833a'
-    else:
-        return 'PASS', '#27ae60'
+def req_status(req_cards):
+    c = sum(1 for x in req_cards if x.get('severity') == 'critical')
+    h = sum(1 for x in req_cards if x.get('severity') == 'high')
+    m = sum(1 for x in req_cards if x.get('severity') == 'medium')
+    if c + h > 0: return 'FAIL', '#7a2e2e'
+    elif m > 0:   return 'REVIEW', '#d4833a'
+    else:         return 'PASS', '#27ae60'
 
+# Risk score based on CARDS
 weights = {'critical': 40, 'high': 20, 'medium': 5, 'low': 1, 'info': 0}
-raw_score = sum(weights.get(fi.get('severity','info'), 0) for fi in findings)
+raw_score = sum(weights.get(c['severity'], 0) for c in cards)
 risk_score = min(100, raw_score)
 
 has_crit_high = sev_counts.get('critical', 0) + sev_counts.get('high', 0) > 0
 has_medium = sev_counts.get('medium', 0) > 0
 
 if has_crit_high:
-    scan_status = "FAIL"
-    status_color = '#7a2e2e'
-    status_bg = '#fdecec'
+    scan_status, status_color, status_bg = "FAIL", '#7a2e2e', '#fdecec'
     status_detail = "Ambiente NÃO conforme — vulnerabilidades Críticas/Altas encontradas exigem remediação antes do próximo ciclo trimestral"
 elif has_medium:
-    scan_status = "REVIEW"
-    status_color = '#d4833a'
-    status_bg = '#fdf6ec'
+    scan_status, status_color, status_bg = "REVIEW", '#d4833a', '#fdf6ec'
     status_detail = "Ambiente em revisão — vulnerabilidades Médias identificadas devem ser tratadas no plano de remediação"
 else:
-    scan_status = "PASS"
-    status_color = '#27ae60'
-    status_bg = '#ecfdec'
+    scan_status, status_color, status_bg = "PASS", '#27ae60', '#ecfdec'
     status_detail = "Ambiente em conformidade com PCI DSS 4.0 para este ciclo trimestral"
 
 req_status_counts = {'PASS': 0, 'REVIEW': 0, 'FAIL': 0}
-for req_findings in req_groups.values():
-    st, _ = req_status(req_findings)
+for rc in req_groups.values():
+    st, _ = req_status(rc)
     req_status_counts[st] += 1
-
 total_reqs = len(req_groups)
 
 def esc(s):
@@ -1385,7 +1288,7 @@ def sev_badge(sev):
     return f'<span style="background:{c};color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold">{sev.upper()}</span>'
 
 def tool_badge(tool):
-    colors = {"nmap":"#2563EB","nuclei":"#3498db","zap":"#e74c3c","testssl":"#0891b2","curl":"#6b7280","ssh":"#059669","ssh-auth":"#059669","lynis":"#8e44ad","trivy":"#d35400","policy":"#d4833a","manual":"#6b7280"}
+    colors = {"nmap":"#2563EB","nuclei":"#3498db","zap":"#e74c3c","testssl":"#0891b2","curl":"#6b7280","ssh":"#059669","ssh-auth":"#059669","policy":"#d4833a"}
     c = colors.get(tool, "#666")
     return f'<span class="source-badge" style="background:{c};color:white">{esc(tool)}</span>'
 
@@ -1397,7 +1300,6 @@ body{{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:#
 .container{{max-width:1200px;margin:0 auto;background:white;border-radius:10px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.1)}}
 .header{{background:#1a3a4f;color:white;padding:30px;text-align:center}}.header h1{{margin:0 0 10px}}
 .content{{padding:30px}}
-
 .status-hero{{background:{status_bg};border:3px solid {status_color};border-radius:12px;padding:40px 30px;margin:20px 0 30px;text-align:center}}
 .status-hero .label{{font-size:13px;color:#666;letter-spacing:3px;text-transform:uppercase;margin-bottom:8px}}
 .status-hero .badge{{font-size:64px;font-weight:900;color:{status_color};letter-spacing:6px;margin:0}}
@@ -1407,14 +1309,11 @@ body{{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:#
 .status-hero .req-bar .pass{{color:#27ae60;font-weight:bold}}
 .status-hero .req-bar .review{{color:#d4833a;font-weight:bold}}
 .status-hero .req-bar .fail{{color:#7a2e2e;font-weight:bold}}
-
 .sev-summary{{display:flex;gap:10px;margin:20px 0;flex-wrap:wrap;justify-content:center}}
 .sev-chip{{display:flex;align-items:center;gap:8px;padding:8px 16px;background:#f8f9fa;border:1px solid #e0e0e0;border-radius:20px;font-size:13px}}
 .sev-chip .dot{{width:10px;height:10px;border-radius:50%}}
 .sev-chip .count{{font-weight:bold;font-size:16px}}
-
 .info-box{{background:#e8f4f8;padding:15px;border-radius:8px;margin:20px 0;border-left:4px solid #1a3a4f}}
-
 .req-section{{margin:30px 0;border:1px solid #e0e0e0;border-radius:10px;overflow:hidden}}
 .req-section-header{{padding:18px 22px;color:white;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}}
 .req-section-header .title{{font-size:18px;font-weight:bold;margin:0}}
@@ -1424,27 +1323,22 @@ body{{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:#
 .req-status-fail{{background:linear-gradient(135deg,#7a2e2e,#a04545)}}
 .req-status-review{{background:linear-gradient(135deg,#d4833a,#e09f5e)}}
 .req-status-pass{{background:linear-gradient(135deg,#27ae60,#4cc27d)}}
-
 .vuln{{border:1px solid #ddd;margin:15px 0;padding:18px;border-radius:8px;background:#fafafa}}
-.vuln.critical{{border-left:10px solid #7a2e2e}}
-.vuln.high{{border-left:10px solid #b34e4e}}
-.vuln.medium{{border-left:10px solid #d4833a}}
-.vuln.low{{border-left:10px solid #4a7c8c}}
-.vuln.info{{border-left:10px solid #6e8f72}}
+.vuln.critical{{border-left:10px solid #7a2e2e}}.vuln.high{{border-left:10px solid #b34e4e}}
+.vuln.medium{{border-left:10px solid #d4833a}}.vuln.low{{border-left:10px solid #4a7c8c}}.vuln.info{{border-left:10px solid #6e8f72}}
 .vuln h3{{margin-top:0;font-size:15px}}
 .source-badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold;margin-left:8px}}
-
+.occ-badge{{display:inline-block;background:#1a3a4f;color:white;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:bold;margin-left:8px}}
 table{{width:100%;border-collapse:collapse;margin:10px 0}}
 th,td{{border:1px solid #ddd;padding:10px;text-align:left;vertical-align:top}}
 th{{background:#f5f5f5;font-weight:600}}
 h2{{color:#1a3a4f;border-bottom:2px solid #e0e0e0;padding-bottom:8px;margin-top:30px}}
-
 code{{background:#f4f4f4;padding:1px 4px;border-radius:3px;font-size:12px}}
 .evidence-box{{background:#2d3436;color:#dfe6e9;padding:10px 14px;font-family:monospace;font-size:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto}}
 .remed-box{{background:#e8f8e8;border-left:4px solid #27ae60;padding:10px 14px;font-size:13px;margin-top:6px;border-radius:4px}}
-
+.targets-list{{margin:6px 0 0;padding-left:18px;font-size:12px;font-family:monospace}}
+.targets-list li{{margin:2px 0}}
 .footer{{background:#f5f5f5;padding:20px;text-align:center;font-size:12px;color:#666}}
-
 @media print{{body{{background:white;padding:0}}.container{{box-shadow:none}}.vuln,.req-section{{break-inside:avoid}}}}
 </style></head><body><div class="container">
 <div class="header"><h1>PCI DSS 4.0 — Relatório de Compliance</h1>
@@ -1454,6 +1348,7 @@ Perfil: {meta.get("profile","full")} &nbsp;|&nbsp; Autenticado: {"Sim ✓" if me
 Alvos: {meta.get("web_targets",0)} web + {meta.get("infra_targets",0)} infra &nbsp;|&nbsp; <strong>CONFIDENCIAL</strong></p></div>
 <div class="content">''')
 
+# ═══════════════ HERO STATUS ═══════════════
 P.append(f'''<div class="status-hero">
   <div class="label">STATUS DE COMPLIANCE PCI DSS 4.0</div>
   <div class="badge">{scan_status}</div>
@@ -1465,40 +1360,41 @@ P.append(f'''<div class="status-hero">
   </div>
 </div>''')
 
+# ═══════════════ SEVERITY CHIPS (contagem de CARDS, não ocorrências) ═══════════════
 P.append('<div class="sev-summary">')
 for sev in sev_order:
     count = sev_counts.get(sev, 0)
     if count > 0:
-        P.append(f'<div class="sev-chip"><span class="dot" style="background:{sev_colors[sev]}"></span>{sev_labels_map[sev]} <span class="count" style="color:{sev_colors[sev]}">{count}</span></div>')
+        label = sev_labels_map[sev]
+        P.append(f'<div class="sev-chip"><span class="dot" style="background:{sev_colors[sev]}"></span>{label} <span class="count" style="color:{sev_colors[sev]}">{count}</span></div>')
 P.append('</div>')
 
+# ═══════════════ META INFO ═══════════════
 P.append(f'''<div class="info-box">
-<p><strong>Total de Findings:</strong> {len(findings)} &nbsp;|&nbsp;
-<strong>Requisitos PCI Avaliados:</strong> {total_reqs} &nbsp;|&nbsp;
+<p><strong>Vulnerabilidades Únicas:</strong> {total_cards} cards &nbsp;|&nbsp;
+<strong>Total de Ocorrências:</strong> {total_occurrences} &nbsp;|&nbsp;
+<strong>Requisitos Avaliados:</strong> {total_reqs} &nbsp;|&nbsp;
 <strong>Risk Score:</strong> {risk_score}/100</p>
-<p><strong>Ferramentas:</strong> nmap + Nuclei + OWASP ZAP + testssl + Lynis + Trivy &nbsp;|&nbsp;
-<strong>Scan Paralelo:</strong> Ativado ({max_parallel} threads)</p>
+<p><strong>Ferramentas:</strong> nmap + Nuclei + OWASP ZAP + testssl &nbsp;|&nbsp;
+<strong>Scan Paralelo:</strong> Ativado</p>
 </div>''')
 
+# ═══════════════ VULNERABILITIES BY PCI REQUIREMENT ═══════════════
 P.append('<h2>Vulnerabilidades por Requisito PCI DSS</h2>')
 
-def req_sort_key(req_key):
-    findings_list = req_groups[req_key]
-    st, _ = req_status(findings_list)
-    sort_map = {'FAIL': 0, 'REVIEW': 1, 'PASS': 2}
-    return (sort_map.get(st, 3), req_key)
+def req_sort_key(rk):
+    st, _ = req_status(req_groups[rk])
+    return ({'FAIL': 0, 'REVIEW': 1, 'PASS': 2}.get(st, 3), rk)
 
-sorted_reqs = sorted(req_groups.keys(), key=req_sort_key)
-
-for req_key in sorted_reqs:
-    req_findings = req_groups[req_key]
-    title, desc = req_meta.get(req_key, (req_key, 'PCI DSS 4.0 requirement'))
-    st, st_color = req_status(req_findings)
+for req_key in sorted(req_groups.keys(), key=req_sort_key):
+    req_cards = req_groups[req_key]
+    title, desc = req_meta.get(req_key, (req_key, 'PCI DSS 4.0'))
+    st, _ = req_status(req_cards)
     st_class = f"req-status-{st.lower()}"
     st_icon = {'PASS': '✓', 'REVIEW': '⚠', 'FAIL': '✗'}[st]
 
-    req_sev_count = Counter(fi.get('severity','info') for fi in req_findings)
-    sev_summary = " · ".join(f"{sev_labels_map[s]}: {req_sev_count[s]}" for s in sev_order if req_sev_count.get(s,0) > 0)
+    req_sev = Counter(c['severity'] for c in req_cards)
+    sev_summary = " · ".join(f"{sev_labels_map[s]}: {req_sev[s]}" for s in sev_order if req_sev.get(s, 0) > 0)
 
     P.append(f'''<div class="req-section">
   <div class="req-section-header {st_class}">
@@ -1510,57 +1406,69 @@ for req_key in sorted_reqs:
   </div>
   <div class="req-section-body">''')
 
-    sorted_findings = sorted(req_findings, key=lambda x: sev_order.index(x.get('severity','info')))
-    main_findings = [fi for fi in sorted_findings if fi.get('severity') in ('critical','high','medium')]
-    aux_findings = [fi for fi in sorted_findings if fi.get('severity') in ('low','info')]
+    sorted_cards = sorted(req_cards, key=lambda x: sev_order.index(x.get('severity', 'info')))
+    main_cards = [c for c in sorted_cards if c['severity'] in ('critical', 'high', 'medium')]
+    aux_cards = [c for c in sorted_cards if c['severity'] in ('low', 'info')]
 
-    if main_findings:
-        for fi in main_findings:
-            sev = fi.get('severity','info')
-            cve_part = ''
-            if fi.get('cve'):
-                cve_part = f'<br><small style="color:#555">{esc(fi["cve"])}</small>'
-            cvss_part = ''
-            if fi.get('cvss') and fi.get('cvss',0) > 0:
-                cvss_part = f' <span style="background:{sev_colors[sev]};color:white;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:bold">CVSS {fi["cvss"]}</span>'
+    if main_cards:
+        for c in main_cards:
+            sev = c['severity']
+            n_targets = len(c['targets'])
+            occ_label = f'<span class="occ-badge">{n_targets} alvo(s)</span>' if n_targets > 1 else ''
+            cve_part = f'<br><small style="color:#555">{esc(c["cve"])}</small>' if c.get('cve') else ''
+            cvss_part = f' <span style="background:{sev_colors[sev]};color:white;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:bold">CVSS {c["cvss"]}</span>' if c.get('cvss', 0) > 0 else ''
 
             P.append(f'''    <div class="vuln {sev}">
-      <h3>{esc(fi.get("title","(sem título)"))} {tool_badge(fi.get("tool","manual"))} {sev_badge(sev)}{cvss_part}{cve_part}</h3>
-      <table>
-        <tr><th style="width:120px">Alvo</th><td><code>{esc(fi.get("target",""))}</code></td></tr>
-        <tr><th>Descrição</th><td>{esc(fi.get("detail","")[:500])}</td></tr>''')
-            if fi.get('evidence'):
-                P.append(f'        <tr><th>Evidência</th><td><div class="evidence-box">{esc(fi["evidence"][:1500])}</div></td></tr>')
-            P.append(f'        <tr><th>Recomendação</th><td><div class="remed-box">💡 {esc(fi.get("remediation",""))}</div></td></tr>')
+      <h3>{esc(c["title"])} {tool_badge(c.get("tool",""))} {sev_badge(sev)}{occ_label}{cvss_part}{cve_part}</h3>
+      <table>''')
+
+            # Target(s)
+            if n_targets == 1:
+                P.append(f'        <tr><th style="width:120px">Alvo</th><td><code>{esc(c["targets"][0])}</code></td></tr>')
+            else:
+                targets_html = ''.join(f'<li><code>{esc(t)}</code></li>' for t in c['targets'][:15])
+                extra = f'<li style="color:#666;font-style:italic">... e mais {n_targets - 15} alvo(s)</li>' if n_targets > 15 else ''
+                P.append(f'        <tr><th style="width:120px">Alvos Afetados</th><td><strong>{n_targets} ocorrência(s)</strong><ul class="targets-list">{targets_html}{extra}</ul></td></tr>')
+
+            P.append(f'        <tr><th>Descrição</th><td>{esc(c.get("detail","")[:500])}</td></tr>')
+            if c.get('evidence'):
+                P.append(f'        <tr><th>Evidência</th><td><div class="evidence-box">{esc(c["evidence"][:1500])}</div></td></tr>')
+            P.append(f'        <tr><th>Recomendação</th><td><div class="remed-box">💡 {esc(c.get("remediation",""))}</div></td></tr>')
             P.append('      </table>\n    </div>')
 
-    if aux_findings:
+    if aux_cards:
+        total_aux_occ = sum(len(c['targets']) for c in aux_cards)
         P.append(f'''    <details style="margin-top:15px">
       <summary style="cursor:pointer;padding:10px;background:#f8f9fa;border-radius:6px;font-weight:600;color:#666">
-        Findings Baixos e Informativos ({len(aux_findings)})
+        Findings Baixos e Informativos — {len(aux_cards)} tipo(s), {total_aux_occ} ocorrência(s)
       </summary>
       <table style="margin-top:10px">
-        <thead><tr><th style="width:80px">Sev</th><th>Finding</th><th>Alvo</th><th style="width:80px">Tool</th></tr></thead>
+        <thead><tr><th style="width:80px">Sev</th><th>Finding</th><th>Alvos</th><th style="width:80px">Tool</th></tr></thead>
         <tbody>''')
-        for fi in aux_findings:
-            sev = fi.get('severity','info')
-            P.append(f'          <tr><td>{sev_badge(sev)}</td><td>{esc(fi.get("title","")[:100])}</td><td style="font-family:monospace;font-size:12px">{esc(fi.get("target","")[:60])}</td><td>{esc(fi.get("tool",""))}</td></tr>')
+        for c in aux_cards:
+            n = len(c['targets'])
+            targets_str = ', '.join(c['targets'][:3])
+            if n > 3:
+                targets_str += f' (+{n-3})'
+            P.append(f'          <tr><td>{sev_badge(c["severity"])}</td><td>{esc(c["title"][:100])}</td><td style="font-family:monospace;font-size:12px">{esc(targets_str)}</td><td>{esc(c.get("tool",""))}</td></tr>')
         P.append('        </tbody>\n      </table>\n    </details>')
 
-    if not main_findings and not aux_findings:
+    if not main_cards and not aux_cards:
         P.append('    <p style="color:#27ae60;font-weight:600;margin:10px 0">✓ Nenhum finding neste requisito</p>')
 
     P.append('  </div>\n</div>')
 
+# ═══════════════ REMEDIATION PLAN ═══════════════
 P.append(f'''<h2>Plano de Remediação — 3 Horizontes</h2>
 <table>
-<thead><tr><th style="width:180px">Horizonte</th><th style="width:120px">Prazo</th><th>Ação</th><th style="width:100px">Findings</th></tr></thead>
+<thead><tr><th style="width:180px">Horizonte</th><th style="width:120px">Prazo</th><th>Ação</th><th style="width:100px">Cards</th></tr></thead>
 <tbody>
 <tr><td><strong>H1 — Imediato</strong></td><td>0–30 dias</td><td>Corrigir todas as vulnerabilidades Críticas e Altas. Re-scan obrigatório após correção.</td><td style="color:#7a2e2e;font-weight:bold;text-align:center;font-size:18px">{sev_counts.get("critical",0) + sev_counts.get("high",0)}</td></tr>
-<tr><td><strong>H2 — Curto prazo</strong></td><td>30–90 dias</td><td>Corrigir findings Médios e implementar hardening. Aplicar security headers, desabilitar protocolos obsoletos.</td><td style="color:#d4833a;font-weight:bold;text-align:center;font-size:18px">{sev_counts.get("medium",0)}</td></tr>
+<tr><td><strong>H2 — Curto prazo</strong></td><td>30–90 dias</td><td>Corrigir findings Médios e implementar hardening. Security headers, protocolos obsoletos.</td><td style="color:#d4833a;font-weight:bold;text-align:center;font-size:18px">{sev_counts.get("medium",0)}</td></tr>
 <tr><td><strong>H3 — Contínuo</strong></td><td>90+ dias</td><td>Endereçar Low/Info e manter ciclo de scans trimestrais conforme Req 11.3.1.</td><td style="color:#4a7c8c;font-weight:bold;text-align:center;font-size:18px">{sev_counts.get("low",0) + sev_counts.get("info",0)}</td></tr>
 </tbody></table>''')
 
+# ═══════════════ FOOTER ═══════════════
 P.append(f'''</div>
 <div class="footer">
 <p><strong>CONFIDENCIAL — USO INTERNO</strong></p>
@@ -1574,8 +1482,10 @@ with open(report_file, 'w') as f:
     f.write(html_out)
 
 print(f"Relatório: {report_file}")
-print(f"Findings: {len(findings)} | C={sev_counts.get('critical',0)} H={sev_counts.get('high',0)} M={sev_counts.get('medium',0)} L={sev_counts.get('low',0)} I={sev_counts.get('info',0)}")
+print(f"Cards: {total_cards} únicos | Ocorrências: {total_occurrences} total")
+print(f"C={sev_counts.get('critical',0)} H={sev_counts.get('high',0)} M={sev_counts.get('medium',0)} L={sev_counts.get('low',0)} I={sev_counts.get('info',0)}")
 print(f"Status: {scan_status} | Requisitos: {total_reqs} (PASS={req_status_counts['PASS']} REVIEW={req_status_counts['REVIEW']} FAIL={req_status_counts['FAIL']})")
+
 PYREPORT
 timer_end
 
@@ -1599,6 +1509,7 @@ echo ""
 echo -e "${GREEN}Abrir relatório: ${BOLD}xdg-open ${REPORT_FILE}${NC}"
 echo ""
 
+# ─── Save to quarterly history ───
 cp "$REPORT_FILE" "$OUTDIR/history/pci_dss_${QUARTER}.html" 2>/dev/null || true
 echo "$SCAN_DATE_HUMAN | $TOTAL_FINDINGS findings | Profile: $PROFILE" >> "$OUTDIR/history/scan_log.txt"
 
