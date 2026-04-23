@@ -424,7 +424,7 @@ bash pci_scan.sh -t https://your-test-target.com -p web-only
 
 <div align="center">
 
-**Built by [trickMeister](https://github.com/trickMeister1337NAME)** 🐝
+**Built by [trickMeister](https://github.com/trickMeister1337NAME)** 
 
 *Part of the SWARM security toolkit*
 
