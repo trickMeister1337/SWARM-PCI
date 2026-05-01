@@ -1339,6 +1339,20 @@ code{{background:#f4f4f4;padding:1px 4px;border-radius:3px;font-size:12px}}
 .targets-list{{margin:6px 0 0;padding-left:18px;font-size:12px;font-family:monospace}}
 .targets-list li{{margin:2px 0}}
 .footer{{background:#f5f5f5;padding:20px;text-align:center;font-size:12px;color:#666}}
+.target-status-table{{width:100%;border-collapse:collapse;margin:20px 0}}
+.target-status-table th{{background:#1a3a4f;color:white;padding:10px 14px;text-align:center;font-size:12px;text-transform:uppercase;letter-spacing:1px}}
+.target-status-table th:first-child{{text-align:left}}
+.target-status-table td{{padding:10px 14px;border-bottom:1px solid #e0e0e0;text-align:center;font-size:13px}}
+.target-status-table td:first-child{{text-align:left}}
+.target-status-table tr:hover td{{background:#f8f9fa}}
+.target-status-table tr.url-fail td{{background:#fdf2f2}}
+.target-status-table tr.url-review td{{background:#fdf8f2}}
+.target-status-table tr.url-pass td{{background:#f2fdf5}}
+.url-status-badge{{display:inline-block;padding:4px 14px;border-radius:20px;font-weight:bold;font-size:12px;letter-spacing:1px}}
+.url-status-badge.url-fail{{background:#7a2e2e;color:white}}
+.url-status-badge.url-review{{background:#d4833a;color:white}}
+.url-status-badge.url-pass{{background:#27ae60;color:white}}
+
 @media print{{body{{background:white;padding:0}}.container{{box-shadow:none}}.vuln,.req-section{{break-inside:avoid}}}}
 </style></head><body><div class="container">
 <div class="header"><h1>PCI DSS 4.0 — Relatório de Compliance</h1>
@@ -1359,6 +1373,65 @@ P.append(f'''<div class="status-hero">
     <div><span class="fail">✗ {req_status_counts["FAIL"]}</span> não conformes</div>
   </div>
 </div>''')
+
+# ═══════════════ PER-URL STATUS ═══════════════
+# Group raw findings by target host (normalize URLs to domain)
+import re as _re
+def _normalize_host(target):
+    """Extract host from URL or IP:port"""
+    t = _re.sub(r'^https?://', '', str(target))
+    t = t.split('/')[0].split(':')[0]
+    return t.lower()
+
+host_findings = defaultdict(list)
+for fi in raw_findings:
+    t = fi.get('target', '')
+    if t and t != 'ALL':
+        host = _normalize_host(t)
+        if host:
+            host_findings[host].append(fi)
+
+if len(host_findings) > 1:
+    P.append('<h2>Status por Alvo</h2>')
+    P.append('''<table class="target-status-table">
+  <thead><tr><th>Alvo</th><th>Status</th><th>C</th><th>H</th><th>M</th><th>L</th><th>I</th><th>Total</th></tr></thead>
+  <tbody>''')
+
+    for host in sorted(host_findings.keys()):
+        hf = host_findings[host]
+        hc = Counter(f.get('severity','info') for f in hf)
+        h_total = len(hf)
+        if hc.get('critical',0) + hc.get('high',0) > 0:
+            h_status, h_icon, h_cls = 'FAIL', '✗', 'url-fail'
+        elif hc.get('medium',0) > 0:
+            h_status, h_icon, h_cls = 'REVIEW', '⚠', 'url-review'
+        else:
+            h_status, h_icon, h_cls = 'PASS', '✓', 'url-pass'
+
+        P.append(f'''    <tr class="{h_cls}">
+      <td><code>{esc(host)}</code></td>
+      <td class="url-status-cell"><span class="url-status-badge {h_cls}">{h_icon} {h_status}</span></td>
+      <td>{hc.get("critical",0) or "-"}</td>
+      <td>{hc.get("high",0) or "-"}</td>
+      <td>{hc.get("medium",0) or "-"}</td>
+      <td>{hc.get("low",0) or "-"}</td>
+      <td>{hc.get("info",0) or "-"}</td>
+      <td><strong>{h_total}</strong></td>
+    </tr>''')
+
+    P.append('  </tbody>\n</table>')
+elif len(host_findings) == 1:
+    # Single target — show inline status
+    host = list(host_findings.keys())[0]
+    hf = host_findings[host]
+    hc = Counter(f.get('severity','info') for f in hf)
+    if hc.get('critical',0) + hc.get('high',0) > 0:
+        h_status, h_icon, h_cls = 'FAIL', '✗', 'url-fail'
+    elif hc.get('medium',0) > 0:
+        h_status, h_icon, h_cls = 'REVIEW', '⚠', 'url-review'
+    else:
+        h_status, h_icon, h_cls = 'PASS', '✓', 'url-pass'
+    P.append(f'<div class="info-box"><strong>Alvo:</strong> <code>{esc(host)}</code> &nbsp;→&nbsp; <span class="url-status-badge {h_cls}">{h_icon} {h_status}</span> &nbsp;|&nbsp; {len(hf)} ocorrência(s)</div>')
 
 # ═══════════════ SEVERITY CHIPS (contagem de CARDS, não ocorrências) ═══════════════
 P.append('<div class="sev-summary">')
@@ -1485,6 +1558,7 @@ print(f"Relatório: {report_file}")
 print(f"Cards: {total_cards} únicos | Ocorrências: {total_occurrences} total")
 print(f"C={sev_counts.get('critical',0)} H={sev_counts.get('high',0)} M={sev_counts.get('medium',0)} L={sev_counts.get('low',0)} I={sev_counts.get('info',0)}")
 print(f"Status: {scan_status} | Requisitos: {total_reqs} (PASS={req_status_counts['PASS']} REVIEW={req_status_counts['REVIEW']} FAIL={req_status_counts['FAIL']})")
+
 
 PYREPORT
 timer_end
