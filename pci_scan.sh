@@ -16,7 +16,7 @@
 set -uo pipefail
 
 # ─── Versão e identificação ───
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_SHA256=""   # preenchido em runtime se possível
 
 # ─── Colors ───
@@ -993,14 +993,26 @@ with open(nf) as nfp, open(ff,'a') as ffp:
             if cw: cwe = cw[0] if isinstance(cw,list) else str(cw)
             try: cvss = float(cls.get('cvss-score', 0) or 0)
             except: cvss = 0.0
+            sev_in = info.get('severity','info')
+            sev = sm.get(sev_in,'info')
+            # Eleva severity se CVSS real >= 9.0 e nuclei marcou apenas "high"
+            if cvss >= 9.0 and sev == 'high': sev = 'critical'
+            # Evidência rica para o time corrigir
+            ev_parts = []
+            if it.get('matched-at'): ev_parts.append(f"matched={it['matched-at']}")
+            if it.get('extracted-results'):
+                er = it['extracted-results']
+                ev_parts.append(f"extracted={','.join(er) if isinstance(er,list) else er}"[:400])
+            if it.get('matcher-name'): ev_parts.append(f"matcher={it['matcher-name']}")
+            if it.get('curl-command'): ev_parts.append(f"curl={it['curl-command'][:600]}")
             ffp.write(json.dumps({
-                'severity': sm.get(info.get('severity','info'),'info'),
+                'severity': sev,
                 'pci_req': pci(tags, it.get('template-id','')),
-                'title': str(info.get('name', it.get('template-id',''))),
+                'title': str(info.get('name', it.get('template-id','')))[:200],
                 'target': str(it.get('matched-at', it.get('host',''))),
-                'detail': str(info.get('description',''))[:500],
-                'evidence': str(it.get('curl-command',''))[:1500],
-                'remediation': str(info.get('remediation', f"Corrigir {it.get('template-id','')}")),
+                'detail': str(info.get('description',''))[:600],
+                'evidence': ' | '.join(ev_parts)[:2000],
+                'remediation': str(info.get('remediation', f"Aplicar patch / template={it.get('template-id','')}"))[:500],
                 'tool':'nuclei','cve':cve,'cvss':cvss,'cwe':cwe
             })+"\n"); count += 1
         except Exception: continue
@@ -1069,9 +1081,10 @@ if command -v zaproxy &>/dev/null && [[ $SKIP_ZAP -eq 0 ]] && [[ ${#WEB_TARGETS[
             python3 - "$ZALERTS" "$FINDINGS_FILE" <<'PYZAP' || true
 import json, sys, re
 zf, ff = sys.argv[1], sys.argv[2]
-risk_map = {'3':'critical','2':'high','1':'medium','0':'low'}
-# CVSS aproximado a partir do risco ZAP
-cvss_map = {'critical':9.0,'high':7.5,'medium':5.0,'low':3.0}
+risk_map = {'3':'high','2':'medium','1':'low','0':'info'}
+# CVSS aproximado a partir do risco ZAP, modulado por confidence
+cvss_map = {'high':7.5,'medium':5.0,'low':3.0,'info':0.0}
+conf_factor = {'4':1.0,'3':0.9,'2':0.75,'1':0.5,'0':0.4}
 cwe_pci = {'89':'Req 6.2.4','79':'Req 6.2.4','22':'Req 6.2.4','352':'Req 6.2.4',
            '200':'Req 2.2.7','614':'Req 4.2.1','693':'Req 6.2.4','16':'Req 2.2',
            '525':'Req 6.2.4','829':'Req 6.2.4','311':'Req 4.2.1','327':'Req 4.2.1'}
@@ -1082,23 +1095,33 @@ count = 0
 with open(ff,'a') as ff_:
     for a in data.get('alerts', []):
         risk = str(a.get('risk','0'))
+        conf = str(a.get('confidence','2'))
         sev = risk_map.get(risk,'info')
+        # Demove severidade quando confiança é "Low/False Positive" para evitar inflar o contador
+        if sev == 'high' and conf in ('0','1'): sev = 'medium'
+        elif sev == 'medium' and conf == '0': sev = 'low'
         cwe = str(a.get('cweid',''))
         req = cwe_pci.get(cwe, 'Req 6.2.4')
         cve = ''
         m = re.search(r'(CVE-\d{4}-\d+)', a.get('reference',''))
         if m: cve = m.group(1)
+        # Evidência rica: param + attack + evidence + matched URL
+        ev_parts = []
+        if a.get('param'): ev_parts.append(f"param={a['param']}")
+        if a.get('attack'): ev_parts.append(f"attack={a['attack'][:200]}")
+        if a.get('evidence'): ev_parts.append(f"evidence={a['evidence'][:300]}")
+        if a.get('url'): ev_parts.append(f"url={a['url']}")
         ff_.write(json.dumps({
             'severity': sev,
             'pci_req': req,
             'title': a.get('alert', a.get('name','ZAP Alert')),
             'target': a.get('url',''),
-            'detail': a.get('description',''),
-            'evidence': a.get('evidence','') or a.get('attack',''),
+            'detail': a.get('description','')[:800],
+            'evidence': ' | '.join(ev_parts) if ev_parts else (a.get('evidence','') or a.get('attack','')),
             'remediation': a.get('solution','Corrigir conforme OWASP'),
             'tool': 'zap',
             'cve': cve,
-            'cvss': cvss_map.get(sev, 0.0),
+            'cvss': round(cvss_map.get(sev, 0.0) * conf_factor.get(conf, 0.75), 1),
             'cwe': f"CWE-{cwe}" if cwe else ""
         })+"\n"); count += 1
 print(f"  → {count} ZAP findings")
@@ -1305,10 +1328,13 @@ import json, sys, hashlib, os, datetime, urllib.request, ssl
 src, out, diff_file, prev, sla_days = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
 
 def fp(fi):
-    key = (fi.get('title','')[:80], fi.get('target',''), fi.get('cve',''), fi.get('cwe',''))
+    # Fingerprint NÃO inclui target → agrupa mesma vuln em vários hosts
+    key = (fi.get('title','')[:80], fi.get('cve',''), fi.get('cwe',''), fi.get('pci_req',''))
     return hashlib.sha1('|'.join(key).encode()).hexdigest()[:12]
 
-# Dedup: agrupa por (title, target, cve, cwe)
+sev_rank = {'critical':4,'high':3,'medium':2,'low':1,'info':0}
+
+# Dedup: agrupa por (title, cve, cwe, pci_req); preserva TODOS os targets/evidências
 seen = {}
 with open(src) as f:
     for line in f:
@@ -1319,18 +1345,28 @@ with open(src) as f:
         k = fp(fi)
         if k not in seen:
             fi['fingerprint'] = k
+            fi['targets'] = [fi.get('target','')] if fi.get('target') else []
+            fi['evidences'] = [fi.get('evidence','')] if fi.get('evidence') else []
+            fi['occurrences'] = 1
             seen[k] = fi
         else:
-            # mantém maior CVSS / mais evidência
-            if fi.get('cvss',0) > seen[k].get('cvss',0): seen[k]['cvss'] = fi['cvss']
-            if len(fi.get('evidence','')) > len(seen[k].get('evidence','')): seen[k]['evidence'] = fi['evidence']
+            s = seen[k]
+            s['occurrences'] = s.get('occurrences',1) + 1
+            tgt = fi.get('target','')
+            if tgt and tgt not in s['targets']: s['targets'].append(tgt)
+            ev = fi.get('evidence','')
+            if ev and ev not in s['evidences'] and len(s['evidences']) < 25:
+                s['evidences'].append(ev)
+            # mantém maior CVSS e severity mais alta
+            if fi.get('cvss',0) > s.get('cvss',0): s['cvss'] = fi['cvss']
+            if sev_rank.get(fi.get('severity','info'),0) > sev_rank.get(s.get('severity','info'),0):
+                s['severity'] = fi['severity']
 
 # CVE age vs SLA (Req 6.3.3)
 def cve_age_days(cve):
     if not cve or not cve.startswith('CVE-'): return None
     try:
         year = int(cve.split('-')[1])
-        # heurística: assume meio do ano de publicação se não buscar NVD
         published = datetime.date(year, 6, 30)
         return (datetime.date.today() - published).days
     except: return None
@@ -1356,7 +1392,7 @@ if prev != 'NONE' and os.path.isfile(prev):
 curr = set(seen.keys())
 prev_keys = set(prev_set.keys())
 for k in curr - prev_keys:
-    diff['new'].append({'fp':k, 'title':seen[k]['title'], 'severity':seen[k]['severity'], 'target':seen[k]['target']})
+    diff['new'].append({'fp':k, 'title':seen[k]['title'], 'severity':seen[k]['severity'], 'targets':seen[k].get('targets',[])})
 for k in prev_keys - curr:
     diff['fixed'].append({'fp':k, 'title':prev_set[k].get('title',''), 'severity':prev_set[k].get('severity','')})
 for k in curr & prev_keys:
@@ -1369,21 +1405,25 @@ with open(diff_file,'w') as f: json.dump(diff, f, indent=2)
 print(f"Dedup: {len(seen)} findings únicos | New: {len(diff['new'])} | Fixed: {len(diff['fixed'])} | SLA breaches: {len(diff['sla_breaches'])}")
 PYDIFF
 
-# Gerar findings adicionais para SLA breach
-if [[ -f "$DIFF_FILE" ]]; then
-    python3 - "$DIFF_FILE" "$FINDINGS_FILE" <<'PYSLA'
+# SLA breaches já estão marcados via flag 'sla_breach' no DEDUP_FILE — não duplicar findings.
+# Apenas eleva severity de findings com SLA breach para garantir que apareçam como crítico.
+if [[ -f "$DEDUP_FILE" ]]; then
+    python3 - "$DEDUP_FILE" <<'PYSLA'
 import json, sys
-df, ff = sys.argv[1], sys.argv[2]
-with open(df) as f: d = json.load(f)
-with open(ff,'a') as out:
-    for b in d.get('sla_breaches', []):
-        out.write(json.dumps({
-            'severity':'critical','pci_req':'Req 6.3.3',
-            'title':f"SLA breach: {b['cve']} aberto há {b['age_days']} dias",
-            'target':'compliance','detail':f"CVE crítico além do SLA de 30 dias","evidence":b['title'],
-            'remediation':'Aplicar patch URGENTE. Ref: Req 6.3.3','tool':'sla-monitor',
-            'cve':b.get('cve',''),'cvss':9.0,'cwe':''
-        })+"\n")
+p = sys.argv[1]
+lines = []
+with open(p) as f:
+    for ln in f:
+        ln = ln.strip()
+        if not ln: continue
+        try: fi = json.loads(ln)
+        except: continue
+        if fi.get('sla_breach'):
+            fi['severity'] = 'critical'
+            fi['title'] = f"[SLA Req 6.3.3 — {fi.get('cve_age_days',0)}d] " + fi.get('title','')
+        lines.append(fi)
+with open(p,'w') as f:
+    for fi in lines: f.write(json.dumps(fi)+"\n")
 PYSLA
 fi
 timer_end
@@ -1416,66 +1456,87 @@ with open(ff) as f:
         try: raw.append(json.loads(line))
         except: pass
 
-total_occ = len(raw)
+# Cada item do dedup já é uma vulnerabilidade ÚNICA (com lista 'targets' e 'evidences')
+# O contador correto:
+#   - total_unique = número de cards (vulnerabilidades distintas)
+#   - total_occ    = soma das ocorrências (instâncias por host)
+total_unique = len(raw)
+total_occ = sum(int(r.get('occurrences', max(1, len(r.get('targets',[]) or [r.get('target','')])))) for r in raw)
 
-# ─── CSV ───
+sev_order = ['critical','high','medium','low','info']
+sev_counts_unique = Counter(r.get('severity','info') for r in raw)
+sev_counts_occ = Counter()
+for r in raw:
+    occ = int(r.get('occurrences', max(1, len(r.get('targets',[])) or 1)))
+    sev_counts_occ[r.get('severity','info')] += occ
+
+sev_labels = {'critical':'CRÍTICO','high':'ALTO','medium':'MÉDIO','low':'BAIXO','info':'INFO'}
+sev_colors = {'critical':'#7a2e2e','high':'#b34e4e','medium':'#d4833a','low':'#4a7c8c','info':'#6e8f72'}
+
+# ─── CSV: uma linha por (vulnerabilidade x target) — completo para tickets ───
 with open(csv_out, 'w', newline='') as cf:
     w = csv.writer(cf)
-    w.writerow(['severity','pci_req','title','target','cve','cwe','cvss','tool','remediation'])
+    w.writerow(['fingerprint','severity','pci_req','title','target','cve','cwe','cvss','tool',
+                'sla_breach','cve_age_days','evidence','remediation'])
     for r in raw:
-        w.writerow([r.get('severity',''), r.get('pci_req',''), r.get('title',''),
-                    r.get('target',''), r.get('cve',''), r.get('cwe',''),
-                    r.get('cvss',0), r.get('tool',''), r.get('remediation','')[:200]])
+        targets = r.get('targets') or ([r.get('target','')] if r.get('target') else [''])
+        evidences = r.get('evidences') or ([r.get('evidence','')] if r.get('evidence') else [''])
+        ev_joined = ' || '.join(e for e in evidences if e)[:1000]
+        for t in targets:
+            w.writerow([r.get('fingerprint',''), r.get('severity',''), r.get('pci_req',''),
+                        r.get('title','')[:200], t, r.get('cve',''), r.get('cwe',''),
+                        r.get('cvss',0), r.get('tool',''),
+                        'yes' if r.get('sla_breach') else 'no',
+                        r.get('cve_age_days',''),
+                        ev_joined, r.get('remediation','')[:300]])
 
-# ─── SARIF v2.1.0 ───
+# ─── SARIF v2.1.0 — uma result por target afetado, com evidência no message ───
 sarif = {
     "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
     "version": "2.1.0",
     "runs": [{
-        "tool": {"driver": {"name": "pci_scan", "version": meta.get("scanner_version","2.0"),
+        "tool": {"driver": {"name": "pci_scan", "version": meta.get("scanner_version","2.1"),
                             "informationUri": "https://omnibees.com.br"}},
         "invocations": [{"executionSuccessful": True,
                          "startTimeUtc": meta.get("scan_date_iso", ""),
                          "machine": meta.get("operator_host","")}],
         "properties": {"pci_dss_version": meta.get("pci_dss_version","4.0.1"),
                        "quarter": quarter,
-                       "operator": meta.get("operator","")},
+                       "operator": meta.get("operator",""),
+                       "total_unique_vulns": total_unique,
+                       "total_occurrences": total_occ},
         "results": []
     }]
 }
 sev_to_sarif = {"critical":"error","high":"error","medium":"warning","low":"note","info":"none"}
 for r in raw:
-    sarif["runs"][0]["results"].append({
-        "ruleId": r.get('cve') or r.get('cwe') or r.get('title','')[:60],
-        "level": sev_to_sarif.get(r.get('severity','info'),'none'),
-        "message": {"text": f"[{r.get('pci_req','')}] {r.get('title','')}"},
-        "locations": [{"physicalLocation": {"artifactLocation": {"uri": r.get('target','')}}}],
-        "properties": {
-            "severity": r.get('severity',''),
-            "pci_requirement": r.get('pci_req',''),
-            "cve": r.get('cve',''), "cwe": r.get('cwe',''), "cvss": r.get('cvss',0),
-            "tool": r.get('tool',''), "remediation": r.get('remediation','')
-        }
-    })
+    targets = r.get('targets') or ([r.get('target','')] if r.get('target') else [''])
+    evidences = r.get('evidences') or ([r.get('evidence','')] if r.get('evidence') else [])
+    ev_text = ' | '.join(e for e in evidences if e)[:1500]
+    msg = f"[{r.get('pci_req','')}] {r.get('title','')}"
+    if ev_text: msg += f"\n\nEvidência: {ev_text}"
+    if r.get('remediation'): msg += f"\n\nRemediação: {r['remediation']}"
+    for t in targets:
+        sarif["runs"][0]["results"].append({
+            "ruleId": r.get('cve') or r.get('cwe') or r.get('fingerprint','')[:60],
+            "level": sev_to_sarif.get(r.get('severity','info'),'none'),
+            "message": {"text": msg},
+            "locations": [{"physicalLocation": {"artifactLocation": {"uri": t}}}],
+            "properties": {
+                "severity": r.get('severity',''),
+                "pci_requirement": r.get('pci_req',''),
+                "cve": r.get('cve',''), "cwe": r.get('cwe',''), "cvss": r.get('cvss',0),
+                "tool": r.get('tool',''),
+                "sla_breach": bool(r.get('sla_breach', False)),
+                "remediation": r.get('remediation','')
+            }
+        })
 with open(sarif_out, 'w') as f: json.dump(sarif, f, indent=2)
 
-# ─── Consolidar cards ───
-card_map = {}
-for fi in raw:
-    key = (fi.get('title',''), fi.get('severity','info'))
-    if key not in card_map:
-        card_map[key] = {**fi, 'targets':[], 'count':0}
-    if fi.get('target') and fi['target'] not in card_map[key]['targets']:
-        card_map[key]['targets'].append(fi['target'])
-    card_map[key]['count'] += 1
-    if fi.get('cvss',0) > card_map[key].get('cvss',0): card_map[key]['cvss'] = fi['cvss']
-cards = list(card_map.values())
-
-sev_order = ['critical','high','medium','low','info']
-sev_counts = Counter(c['severity'] for c in cards)
-sev_labels = {'critical':'CRÍTICO','high':'ALTO','medium':'MÉDIO','low':'BAIXO','info':'INFO'}
-sev_colors = {'critical':'#7a2e2e','high':'#b34e4e','medium':'#d4833a','low':'#4a7c8c','info':'#6e8f72'}
-total_cards = len(cards)
+# Cards = raw já deduplicado
+cards = raw
+sev_counts = sev_counts_unique
+total_cards = total_unique
 
 # Diff data
 diff = {}
@@ -1572,7 +1633,17 @@ ts={esc(meta.get("scan_date_iso",""))}
   <div style="font-size:13px;color:#666;letter-spacing:3px">STATUS DE COMPLIANCE</div>
   <div class="badge">{status}</div>
   <div style="font-size:16px;color:#444;margin-top:12px">{sd}</div>
-</div>''')
+</div>
+
+<h2>Resumo por Severidade</h2>
+<div class="diff-grid" style="grid-template-columns:repeat(5,1fr)">
+  <div class="diff-card" style="border-left:4px solid #7a2e2e"><span class="n" style="color:#7a2e2e">{sev_counts.get("critical",0)}</span><div>CRÍTICO</div><small>{sev_counts_occ.get("critical",0)} ocorr.</small></div>
+  <div class="diff-card" style="border-left:4px solid #b34e4e"><span class="n" style="color:#b34e4e">{sev_counts.get("high",0)}</span><div>ALTO</div><small>{sev_counts_occ.get("high",0)} ocorr.</small></div>
+  <div class="diff-card" style="border-left:4px solid #d4833a"><span class="n" style="color:#d4833a">{sev_counts.get("medium",0)}</span><div>MÉDIO</div><small>{sev_counts_occ.get("medium",0)} ocorr.</small></div>
+  <div class="diff-card" style="border-left:4px solid #4a7c8c"><span class="n" style="color:#4a7c8c">{sev_counts.get("low",0)}</span><div>BAIXO</div><small>{sev_counts_occ.get("low",0)} ocorr.</small></div>
+  <div class="diff-card" style="border-left:4px solid #6e8f72"><span class="n" style="color:#6e8f72">{sev_counts.get("info",0)}</span><div>INFO</div><small>{sev_counts_occ.get("info",0)} ocorr.</small></div>
+</div>
+<p style="font-size:13px;color:#666"><strong>Vulnerabilidades únicas:</strong> {total_unique} | <strong>Ocorrências totais (instâncias por host/URL):</strong> {total_occ} | <strong>Requisitos PCI tocados:</strong> {len(req_groups)}</p>''')
 
 # Diff cards
 if diff:
@@ -1589,8 +1660,6 @@ if diff:
             P.append(f'<tr><td><code>{esc(b.get("cve",""))}</code></td><td>{b.get("age_days",0)}</td><td>{esc(b.get("title","")[:100])}</td></tr>')
         P.append('</tbody></table>')
 
-P.append(f'<div style="background:#e8f4f8;padding:15px;border-radius:8px;margin:20px 0"><p><strong>Vulnerabilidades únicas:</strong> {total_cards} | <strong>Ocorrências:</strong> {total_occ} | <strong>Requisitos:</strong> {len(req_groups)}</p></div>')
-
 P.append('<h2>Vulnerabilidades por Requisito PCI DSS</h2>')
 def rk(k):
     s,_ = req_status(req_groups[k])
@@ -1601,34 +1670,53 @@ for req in sorted(req_groups.keys(), key=rk):
     st,_ = req_status(rc)
     cls = f"req-{st.lower()}"
     icon = {'FAIL':'✗','REVIEW':'⚠','PASS':'✓'}[st]
-    P.append(f'<div class="req-section"><div class="req-section-header {cls}"><div><strong>{esc(req)}</strong> ({len(rc)} cards)</div><div>{icon} {st}</div></div><div class="req-section-body">')
-    for c in sorted(rc, key=lambda x: sev_order.index(x.get('severity','info'))):
-        if c['severity'] in ('low','info'): continue
+    # contagem por severidade no requisito
+    rsev = Counter(x.get('severity','info') for x in rc)
+    badge = ' '.join(f'<span style="background:{sev_colors[s]};color:white;padding:1px 6px;border-radius:3px;font-size:11px;margin-left:4px">{rsev[s]} {sev_labels[s]}</span>' for s in sev_order if rsev.get(s,0)>0)
+    P.append(f'<div class="req-section"><div class="req-section-header {cls}"><div><strong>{esc(req)}</strong> — {len(rc)} vuln(s) {badge}</div><div>{icon} {st}</div></div><div class="req-section-body">')
+    for c in sorted(rc, key=lambda x: (sev_order.index(x.get('severity','info')), -float(x.get('cvss',0) or 0))):
+        sev = c.get('severity','info')
         cve = f' <code>{esc(c.get("cve",""))}</code>' if c.get('cve') else ''
-        cvss = f' <span style="background:{sev_colors[c["severity"]]};color:white;padding:1px 6px;border-radius:3px;font-size:11px">CVSS {c.get("cvss",0)}</span>' if c.get('cvss',0)>0 else ''
-        n = len(c.get('targets',[]))
+        cvss_v = c.get('cvss',0) or 0
+        cvss = f' <span style="background:{sev_colors[sev]};color:white;padding:1px 6px;border-radius:3px;font-size:11px">CVSS {cvss_v}</span>' if cvss_v>0 else ''
+        sla = ' <span style="background:#7a2e2e;color:white;padding:2px 8px;border-radius:3px;font-size:11px">⚠ SLA BREACH</span>' if c.get('sla_breach') else ''
+        targets = c.get('targets') or ([c.get('target','')] if c.get('target') else [])
+        n = len(targets)
         occ = f' <span style="background:#1a3a4f;color:white;padding:2px 10px;border-radius:12px;font-size:11px">{n} alvo(s)</span>' if n>1 else ''
-        P.append(f'<div class="vuln {c["severity"]}"><h3>{esc(c["title"])} {occ}{cvss}{cve}</h3><table>')
-        if n == 1:
-            P.append(f'<tr><th style="width:120px">Alvo</th><td><code>{esc(c["targets"][0])}</code></td></tr>')
+        sev_badge = f'<span style="background:{sev_colors[sev]};color:white;padding:2px 8px;border-radius:3px;font-size:11px;margin-right:6px">{sev_labels[sev]}</span>'
+        P.append(f'<div class="vuln {sev}"><h3>{sev_badge}{esc(c.get("title",""))} {occ}{cvss}{cve}{sla}</h3><table>')
+        P.append(f'<tr><th style="width:130px">Tool / FP</th><td><code>{esc(c.get("tool",""))}</code> · fp=<code>{esc(c.get("fingerprint",""))}</code> · CWE={esc(c.get("cwe","-"))}</td></tr>')
+        if n <= 1:
+            P.append(f'<tr><th>Alvo</th><td><code>{esc(targets[0]) if targets else "-"}</code></td></tr>')
         else:
-            tlist = ''.join(f'<li><code>{esc(t)}</code></li>' for t in c['targets'][:10])
-            P.append(f'<tr><th style="width:120px">Alvos</th><td><ul>{tlist}</ul></td></tr>')
-        P.append(f'<tr><th>Descrição</th><td>{esc(c.get("detail","")[:500])}</td></tr>')
-        if c.get('evidence'):
-            P.append(f'<tr><th>Evidência</th><td><div class="evidence-box">{esc(c["evidence"][:1500])}</div></td></tr>')
+            tlist = ''.join(f'<li><code>{esc(t)}</code></li>' for t in targets[:50])
+            extra = f'<li>... e mais {n-50}</li>' if n>50 else ''
+            P.append(f'<tr><th>Alvos ({n})</th><td><ul style="margin:0;padding-left:18px">{tlist}{extra}</ul></td></tr>')
+        P.append(f'<tr><th>Descrição</th><td>{esc(c.get("detail","")[:800])}</td></tr>')
+        # Evidências: TODAS, sem esconder
+        evidences = c.get('evidences') or ([c.get('evidence','')] if c.get('evidence') else [])
+        evidences = [e for e in evidences if e]
+        if evidences:
+            ev_html = '\n---\n'.join(e[:1500] for e in evidences[:10])
+            extra_ev = f'\n[+{len(evidences)-10} evidências adicionais — ver findings.csv]' if len(evidences)>10 else ''
+            P.append(f'<tr><th>Evidência ({len(evidences)})</th><td><div class="evidence-box">{esc(ev_html+extra_ev)}</div></td></tr>')
+        if c.get('sla_breach'):
+            P.append(f'<tr><th>SLA</th><td style="color:#7a2e2e"><strong>Aberto há {c.get("cve_age_days",0)} dias — viola Req 6.3.3 (≤30d para crítica/alta)</strong></td></tr>')
         P.append(f'<tr><th>Recomendação</th><td><div class="remed-box">💡 {esc(c.get("remediation",""))}</div></td></tr>')
         P.append('</table></div>')
     P.append('</div></div>')
 
+sla_count = sum(1 for c in cards if c.get('sla_breach'))
 P.append(f'''<h2>Plano de Remediação</h2><table>
-<thead><tr><th>Horizonte</th><th>Prazo</th><th>Ação</th><th>Cards</th></tr></thead>
+<thead><tr><th>Horizonte</th><th>Prazo PCI</th><th>Ação</th><th>Vulns únicas</th><th>Ocorrências</th></tr></thead>
 <tbody>
-<tr><td><strong>H1 (Req 6.3.3)</strong></td><td>0–30 dias</td><td>Críticas + Altas + SLA breaches</td><td style="color:#7a2e2e;font-weight:bold;text-align:center">{sev_counts.get("critical",0)+sev_counts.get("high",0)}</td></tr>
-<tr><td><strong>H2</strong></td><td>30–90 dias</td><td>Médias + hardening</td><td style="color:#d4833a;font-weight:bold;text-align:center">{sev_counts.get("medium",0)}</td></tr>
-<tr><td><strong>H3</strong></td><td>90+ dias</td><td>Low/Info + ciclo trimestral</td><td style="color:#4a7c8c;font-weight:bold;text-align:center">{sev_counts.get("low",0)+sev_counts.get("info",0)}</td></tr>
+<tr><td><strong>H0 — SLA BREACH</strong></td><td>IMEDIATO</td><td>CVEs críticos abertos &gt; 30 dias (Req 6.3.3)</td><td style="color:#7a2e2e;font-weight:bold;text-align:center">{sla_count}</td><td style="text-align:center">—</td></tr>
+<tr><td><strong>H1 (Req 6.3.3)</strong></td><td>0–30 dias</td><td>Críticas + Altas</td><td style="color:#7a2e2e;font-weight:bold;text-align:center">{sev_counts.get("critical",0)+sev_counts.get("high",0)}</td><td style="text-align:center">{sev_counts_occ.get("critical",0)+sev_counts_occ.get("high",0)}</td></tr>
+<tr><td><strong>H2</strong></td><td>30–90 dias</td><td>Médias + hardening</td><td style="color:#d4833a;font-weight:bold;text-align:center">{sev_counts.get("medium",0)}</td><td style="text-align:center">{sev_counts_occ.get("medium",0)}</td></tr>
+<tr><td><strong>H3</strong></td><td>90+ dias</td><td>Low/Info + ciclo trimestral</td><td style="color:#4a7c8c;font-weight:bold;text-align:center">{sev_counts.get("low",0)+sev_counts.get("info",0)}</td><td style="text-align:center">{sev_counts_occ.get("low",0)+sev_counts_occ.get("info",0)}</td></tr>
 </tbody></table>
-<div class="footer">CONFIDENCIAL — USO INTERNO | PCI DSS 4.0.1 | {quarter}<br>Exports disponíveis: HTML, CSV, SARIF (v2.1.0) | Hash de integridade no manifesto</div>
+<p style="font-size:12px;color:#666"><em>"Vulns únicas" = problemas distintos. "Ocorrências" = soma de instâncias por host/URL afetado (use para dimensionar esforço operacional).</em></p>
+<div class="footer">CONFIDENCIAL — USO INTERNO | PCI DSS 4.0.1 | {quarter}<br>Exports: HTML · CSV (linha por target) · SARIF v2.1.0 | Integridade: MANIFEST.sha256</div>
 </div></body></html>''')
 
 with open(html_out,'w') as f: f.write('\n'.join(P))
@@ -1658,6 +1746,22 @@ timer_end
 TOTAL_FINDINGS=$(wc -l < "$USE_FINDINGS" 2>/dev/null | tr -d ' '); TOTAL_FINDINGS=${TOTAL_FINDINGS:-0}
 SCAN_END=$(date +"%d/%m/%Y %H:%M:%S")
 
+# Breakdown por severidade (consistente com HTML)
+SEV_BREAKDOWN=$(python3 - "$USE_FINDINGS" <<'PYS'
+import json,sys
+from collections import Counter
+u=Counter(); o=Counter()
+with open(sys.argv[1]) as f:
+    for ln in f:
+        try: r=json.loads(ln)
+        except: continue
+        s=r.get('severity','info'); u[s]+=1
+        occ=int(r.get('occurrences', max(1,len(r.get('targets',[])) or 1)))
+        o[s]+=occ
+print(f"CRITICAL={u['critical']}/{o['critical']} HIGH={u['high']}/{o['high']} MEDIUM={u['medium']}/{o['medium']} LOW={u['low']}/{o['low']} INFO={u['info']}/{o['info']}")
+PYS
+)
+
 echo -e "\n${CYAN}════════════════════════════════════════════════════════════════${NC}"
 echo -e "${CYAN}  RESUMO PCI SCAN v${SCRIPT_VERSION}${NC}"
 echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
@@ -1665,7 +1769,9 @@ echo -e "${BOLD}[+] HTML       :${NC} $REPORT_HTML"
 echo -e "${BOLD}[+] CSV        :${NC} $REPORT_CSV"
 echo -e "${BOLD}[+] SARIF      :${NC} $REPORT_SARIF"
 echo -e "${BOLD}[+] Manifesto  :${NC} $MANIFEST"
-echo -e "${BOLD}[+] Findings   :${NC} $TOTAL_FINDINGS (após dedup)"
+echo -e "${BOLD}[+] Vulns únicas:${NC} $TOTAL_FINDINGS"
+echo -e "${BOLD}[+] Por severidade (únicas/ocorrências):${NC}"
+echo -e "    ${RED}${SEV_BREAKDOWN}${NC}"
 echo -e "${BOLD}[+] Duração    :${NC} ${SECONDS}s"
 echo -e "${BOLD}[+] Concluído  :${NC} $SCAN_END"
 
