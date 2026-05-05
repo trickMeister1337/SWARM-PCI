@@ -1,11 +1,11 @@
-# PCI Scan v2.1 — PCI DSS 4.0.1 Internal Compliance Scanner
+# PCI Scan — PCI DSS 4.0.1 Internal Compliance Scanner
 
 [![PCI DSS](https://img.shields.io/badge/PCI%20DSS-4.0.1-1a3a4f)](https://www.pcisecuritystandards.org/)
 [![Bash](https://img.shields.io/badge/bash-%3E%3D4.4-4eaa25)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/badge/license-Internal-lightgrey)]()
 [![Version](https://img.shields.io/badge/version-2.1.0-blue)]()
 
-> Scanner interno de compliance PCI DSS 4.0.1 desenvolvido pela **Omnibees Security Intelligence**.
+> Scanner interno de compliance PCI DSS 4.0.1 desenvolvido pela **trickMeister1337e**.
 > Orquestra **nmap**, **testssl**, **nuclei**, **OWASP ZAP**, **trivy**, **ssh-audit**, **prowler** e checagens próprias para gerar um relatório acionável (HTML + CSV + SARIF) com evidências, contadores corretos por severidade, dedup inteligente e SLA tracking (Req 6.3.3).
 
 ---
@@ -527,13 +527,12 @@ bash -x pci_scan.sh -t https://example.com 2> scan.debug.log
 
 ## 📄 Licença
 
-**Uso interno — Omnibees Security Intelligence.**
 Distribuição externa, fork público ou redistribuição requerem autorização da equipe de segurança.
 
 ---
 
 ## 👤 Autor / Mantenedor
 
-**[@trickMeister1337](https://github.com/trickMeister1337)** — Omnibees Security Intelligence
+**[@trickMeister1337](https://github.com/trickMeister1337)**
 
 Issues e melhorias: abra um PR ou issue no repositório.
