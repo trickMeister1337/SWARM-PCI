@@ -104,7 +104,7 @@ Os resultados são organizados por data no diretório de output (padrão: `./res
 ---
 
 ## 👤 Autor
-Desenvolvido por **trickMeister1337** (Omnibees Security Intelligence).
+Desenvolvido por **trickMeister1337**
 
 ---
 *Este projeto é mantido para fins de conformidade e segurança. Contribuições são bem-vindas via Pull Requests.*
