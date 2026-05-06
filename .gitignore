@@ -1,6 +1,7 @@
-# Scan output directories
+# Scan output directories (NEVER commit scan results)
 pci_scan_*/
 scan_*/
+swarm_red_*/
 */raw/
 */evidence/
 */history/

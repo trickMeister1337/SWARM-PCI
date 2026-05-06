@@ -1496,7 +1496,7 @@ sarif = {
     "version": "2.1.0",
     "runs": [{
         "tool": {"driver": {"name": "pci_scan", "version": meta.get("scanner_version","2.1"),
-                            "informationUri": "https://omnibees.com.br"}},
+                            "informationUri": "https://example.com"}},
         "invocations": [{"executionSuccessful": True,
                          "startTimeUtc": meta.get("scan_date_iso", ""),
                          "machine": meta.get("operator_host","")}],
