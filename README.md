@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-Internal-lightgrey)]()
 [![Version](https://img.shields.io/badge/version-2.1.0-blue)]()
 
-> Scanner interno de compliance PCI DSS 4.0.1 desenvolvido pela **trickMeister1337e**.
+> Scanner interno de compliance PCI DSS 4.0.1 desenvolvido por **[@trickMeister1337](https://github.com/trickMeister1337)**.
 > Orquestra **nmap**, **testssl**, **nuclei**, **OWASP ZAP**, **trivy**, **ssh-audit**, **prowler** e checagens próprias para gerar um relatório acionável (HTML + CSV + SARIF) com evidências, contadores corretos por severidade, dedup inteligente e SLA tracking (Req 6.3.3).
 
 ---
