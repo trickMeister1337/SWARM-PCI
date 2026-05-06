@@ -160,7 +160,7 @@ is_cidr()        { [[ "$1" =~ /[0-9]+$ ]]; }
 resolve_secret() {
     local raw="$1"
     case "$raw" in
-        ENV:*) echo "${!raw#ENV:}" ;;
+        ENV:*) local varname="${raw#ENV:}"; echo "${!varname}" ;;
         KEY:*) echo "${raw#KEY:}" ;;
         *)     echo "$raw" ;;
     esac
@@ -1496,7 +1496,7 @@ sarif = {
     "version": "2.1.0",
     "runs": [{
         "tool": {"driver": {"name": "pci_scan", "version": meta.get("scanner_version","2.1"),
-                            "informationUri": "https://example.com"}},
+                            "informationUri": "https://omnibees.com.br"}},
         "invocations": [{"executionSuccessful": True,
                          "startTimeUtc": meta.get("scan_date_iso", ""),
                          "machine": meta.get("operator_host","")}],
